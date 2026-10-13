@@ -245,8 +245,17 @@ class ListIssuesTest {
             .inScenario("snyk-issue-snapshots")
             .whenScenarioStateIs("new-issues")
             .willReturn(okJson("""
-                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"},
-                          {"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"}],
+                 "links":{"next":"http://localhost:18089/rest/orgs/org-id/issues?version=2024-10-15&starting_after=cursor-trigger"}}
+                """))
+            .willSetStateTo("new-issues-page2"));
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .withQueryParam("starting_after", equalTo("cursor-trigger"))
+            .inScenario("snyk-issue-snapshots")
+            .whenScenarioStateIs("new-issues-page2")
+            .willReturn(okJson("""
+                {"data":[{"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
                 """))
             .willSetStateTo("stable"));
 
@@ -301,7 +310,7 @@ class ListIssuesTest {
 
         assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
             "unchanged snapshot should not trigger duplicates");
-        verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+        verify(4, getRequestedFor(urlPathEqualTo(PATH)));
     }
 
     private ListIssues task(FetchType fetchType, boolean highAndCritical) {
