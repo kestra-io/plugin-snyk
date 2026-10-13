@@ -1,6 +1,5 @@
 package io.kestra.plugin.snyk;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.kestra.core.http.HttpRequest;
@@ -15,7 +14,6 @@ import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
-import lombok.AccessLevel;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -62,13 +60,7 @@ public abstract class SnykConnection extends Task {
     @NotNull
     @lombok.Builder.Default
     @PluginProperty(group = "connection")
-    @Getter(AccessLevel.NONE)
     protected Property<String> apiVersion = Property.ofValue(DEFAULT_VERSION);
-
-    @JsonProperty("version")
-    public Property<String> getApiVersion() {
-        return apiVersion;
-    }
 
     @Schema(title = "HTTP client options", description = "Optional HTTP settings such as timeouts, proxy, and TLS.")
     @PluginProperty(group = "advanced")

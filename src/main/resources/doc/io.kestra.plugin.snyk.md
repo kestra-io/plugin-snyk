@@ -10,7 +10,7 @@ Store the Snyk API token in a Kestra secret and reference it with `{{ secret('SN
 | --- | --- | --- |
 | `token` | Required | Snyk API token |
 | `baseUrl` | `https://api.snyk.io/rest` | Regional REST API base URL, e.g. `https://api.eu.snyk.io/rest` |
-| `version` | `2024-10-15` | Snyk REST API version |
+| `apiVersion` | `2024-10-15` | Snyk REST API version (sent as the API query parameter `version`) |
 | `orgId` | Required | Snyk organization ID |
 | `severities` | All severities | Optional list of `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW` |
 

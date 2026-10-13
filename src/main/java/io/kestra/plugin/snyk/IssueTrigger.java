@@ -1,6 +1,5 @@
 package io.kestra.plugin.snyk;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
@@ -22,7 +21,6 @@ import io.kestra.core.storages.kv.KVMetadata;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
-import lombok.AccessLevel;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -92,13 +90,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
     @NotNull
     @lombok.Builder.Default
     @PluginProperty(group = "connection")
-    @Getter(AccessLevel.NONE)
     private Property<String> apiVersion = Property.ofValue(SnykConnection.DEFAULT_VERSION);
-
-    @JsonProperty("version")
-    public Property<String> getApiVersion() {
-        return apiVersion;
-    }
 
     @Schema(title = "Snyk organization ID")
     @NotNull
