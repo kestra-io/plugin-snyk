@@ -134,8 +134,9 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         if (previous != null && !previous.pending().isEmpty()) {
             Map<String, Object> nextIssue = previous.pending().getFirst();
             List<Map<String, Object>> remaining = new ArrayList<>(previous.pending().subList(1, previous.pending().size()));
+            Execution generated = execution(conditionContext, context, nextIssue);
             saveState(runContext, context.getNamespace(), key, new State(previous.knownIds(), remaining, true));
-            return Optional.of(execution(conditionContext, context, nextIssue));
+            return Optional.of(generated);
         }
 
         Set<String> known = previous == null ? Set.of() : new LinkedHashSet<>(previous.knownIds());
@@ -171,8 +172,9 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
 
         Map<String, Object> first = newIssues.getFirst();
         List<Map<String, Object>> remaining = new ArrayList<>(newIssues.subList(1, newIssues.size()));
+        Execution generated = execution(conditionContext, context, first);
         saveState(runContext, context.getNamespace(), key, new State(List.copyOf(currentIds), remaining, true));
-        return Optional.of(execution(conditionContext, context, first));
+        return Optional.of(generated);
     }
 
     private Execution execution(ConditionContext conditionContext, TriggerContext context, Map<String, Object> issue) {
