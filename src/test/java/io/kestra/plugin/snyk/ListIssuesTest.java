@@ -10,6 +10,7 @@ import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.runners.RunContextInitializer;
+import io.kestra.core.serializers.FileSerde;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -83,16 +84,33 @@ class ListIssuesTest {
     }
 
     @Test
-    void storeWritesRowsAndReturnsCount() throws Exception {
-        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
-            {"data":[{"id":"issue-1","type":"issue"},{"id":"issue-2","type":"issue"}],"links":{}}
-            """)));
+    void storeWritesAllPagesAndReturnsReadableRows() throws Exception {
+        stubFor(get(urlPathEqualTo(PATH))
+            .willReturn(okJson("""
+                {"data":[{"id":"issue-1","type":"issue"}],"links":{"next":"http://localhost:18089/rest/orgs/org-id/issues?version=2024-10-15&starting_after=cursor-store"}}
+                """)));
 
-        var output = task(FetchType.STORE, false).run(runContextFactory.of());
+        stubFor(get(urlPathEqualTo(PATH))
+            .withQueryParam("starting_after", equalTo("cursor-store"))
+            .willReturn(okJson("""
+                {"data":[{"id":"issue-2","type":"issue"}],"links":{}}
+                """)));
+
+        var runContext = runContextFactory.of();
+        var output = task(FetchType.STORE, false).run(runContext);
 
         assertEquals(2L, output.getSize());
         assertNotNull(output.getUri());
         assertNull(output.getRows());
+
+        try (var stored = runContext.storage().getFile(output.getUri())) {
+            var rows = FileSerde.readAll(stored).collectList().block();
+            assertNotNull(rows);
+            assertEquals(2, rows.size());
+            assertEquals("issue-1", ((Map<?, ?>) rows.get(0)).get("id"));
+            assertEquals("issue-2", ((Map<?, ?>) rows.get(1)).get("id"));
+        }
+        verify(2, getRequestedFor(urlPathEqualTo(PATH)));
     }
 
     @Test
@@ -227,7 +245,8 @@ class ListIssuesTest {
             .inScenario("snyk-issue-snapshots")
             .whenScenarioStateIs("new-issues")
             .willReturn(okJson("""
-                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"},
+                          {"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
                 """))
             .willSetStateTo("stable"));
 

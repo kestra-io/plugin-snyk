@@ -151,8 +151,10 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
                         throw new IllegalStateException("Snyk API returned an issue without an id; trigger state was not advanced.");
                     }
                     String issueId = id.toString();
-                    currentIds.add(issueId);
-                    if (previous != null && previous.initialized() && !known.contains(issueId)) {
+                    // Cursor pagination can overlap when the underlying issue collection changes between pages.
+                    // Only enqueue an ID once per snapshot, even if it appears on multiple pages.
+                    boolean firstOccurrence = currentIds.add(issueId);
+                    if (firstOccurrence && previous != null && previous.initialized() && !known.contains(issueId)) {
                         newIssues.add(issue);
                     }
                 }
