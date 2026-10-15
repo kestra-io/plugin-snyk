@@ -97,7 +97,7 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
         var renderedOrgId = runContext.render(orgId).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("orgId is required and must not be blank."));
-        var renderedSeverities = severities == null ? List.of()
+        var renderedSeverities = severities == null ? List.<Severity>of()
             : runContext.render(severities).asList(Severity.class);
         var mode = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.FETCH);
 
