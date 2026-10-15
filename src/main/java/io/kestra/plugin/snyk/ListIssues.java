@@ -103,7 +103,7 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
 
         return switch (mode) {
             case FETCH_ONE -> {
-                List<Map<String, Object>> issues = SnykConnection.fetchIssues(
+                var issues = SnykConnection.fetchIssues(
                     runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
                     renderedSeverities, false, true
                 );
@@ -113,7 +113,7 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
                     .build();
             }
             case FETCH -> {
-                List<Map<String, Object>> issues = SnykConnection.fetchIssues(
+                var issues = SnykConnection.fetchIssues(
                     runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
                     renderedSeverities, true, false
                 );
@@ -146,7 +146,7 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
                 renderedSeverities, true, false, page -> FileSerde.writeAll(output, Flux.fromIterable(page)).block()
             );
         }
-        URI uri = runContext.storage().putFile(tempFile);
+        var uri = runContext.storage().putFile(tempFile);
         return FetchOutput.builder().uri(uri).size(count).build();
     }
 }

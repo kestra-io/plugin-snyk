@@ -128,15 +128,15 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
 
     private Optional<Execution> evaluateInternal(ConditionContext conditionContext, TriggerContext context) throws Exception {
         var runContext = conditionContext.getRunContext();
-        String renderedToken = runContext.render(token).as(String.class)
+        var renderedToken = runContext.render(token).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("token is required and must not be blank."));
-        String renderedBaseUrl = runContext.render(baseUrl).as(String.class).orElse(SnykConnection.DEFAULT_BASE_URL);
-        String renderedVersion = runContext.render(apiVersion).as(String.class).orElse(SnykConnection.DEFAULT_VERSION);
-        String renderedOrgId = runContext.render(orgId).as(String.class)
+        var renderedBaseUrl = runContext.render(baseUrl).as(String.class).orElse(SnykConnection.DEFAULT_BASE_URL);
+        var renderedVersion = runContext.render(apiVersion).as(String.class).orElse(SnykConnection.DEFAULT_VERSION);
+        var renderedOrgId = runContext.render(orgId).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("orgId is required and must not be blank."));
-        List<SnykConnection.Severity> renderedSeverities = severities == null ? List.of()
+        var renderedSeverities = severities == null ? List.<SnykConnection.Severity>of()
             : runContext.render(severities).asList(SnykConnection.Severity.class);
 
         var key = stateKey(context, renderedOrgId, renderedBaseUrl, renderedVersion, renderedSeverities);
@@ -144,7 +144,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         if (previous != null && !previous.pending().isEmpty()) {
             var nextIssue = previous.pending().getFirst();
             var remaining = new ArrayList<Map<String, Object>>(previous.pending().subList(1, previous.pending().size()));
-            Execution generated = execution(conditionContext, context, nextIssue);
+            var generated = execution(conditionContext, context, nextIssue);
             saveState(runContext, context.getNamespace(), key, new State(previous.knownIds(), remaining, true));
             return Optional.of(generated);
         }
@@ -163,7 +163,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
                     var issueId = id.toString();
                     // Cursor pagination can overlap when the underlying issue collection changes between pages.
                     // Only enqueue an ID once per snapshot, even if it appears on multiple pages.
-                    boolean firstOccurrence = currentIds.add(issueId);
+                    var firstOccurrence = currentIds.add(issueId);
                     if (currentIds.size() > MAX_TRACKED_ISSUE_IDS) {
                         throw new IllegalStateException(
                             "Snyk IssueTrigger found more than " + MAX_TRACKED_ISSUE_IDS + " issues for this filter. " +
@@ -196,8 +196,8 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         }
 
         var first = newIssues.getFirst();
-        List<Map<String, Object>> remaining = new ArrayList<>(newIssues.subList(1, newIssues.size()));
-        Execution generated = execution(conditionContext, context, first);
+        var remaining = new ArrayList<>(newIssues.subList(1, newIssues.size()));
+        var generated = execution(conditionContext, context, first);
         saveState(runContext, context.getNamespace(), key, new State(List.copyOf(currentIds), remaining, true));
         return Optional.of(generated);
     }
@@ -243,15 +243,15 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         if (stored.isEmpty() || stored.get().value() == null) {
             return null;
         }
-        Object raw = stored.get().value();
+        var raw = stored.get().value();
         Map<String, Object> values;
         if (raw instanceof String json) {
             values = MAPPER.readValue(json, new TypeReference<Map<String, Object>>() {});
         } else {
             values = MAPPER.convertValue(raw, new TypeReference<Map<String, Object>>() {});
         }
-        List<String> ids = MAPPER.convertValue(values.getOrDefault("knownIds", List.of()), new TypeReference<List<String>>() {});
-        List<Map<String, Object>> pending = MAPPER.convertValue(values.getOrDefault("pending", List.of()), new TypeReference<List<Map<String, Object>>>() {});
+        var ids = MAPPER.convertValue(values.getOrDefault("knownIds", List.of()), new TypeReference<List<String>>() {});
+        var pending = MAPPER.convertValue(values.getOrDefault("pending", List.of()), new TypeReference<List<Map<String, Object>>>() {});
         return new State(ids, pending, Boolean.TRUE.equals(values.get("initialized")));
     }
 

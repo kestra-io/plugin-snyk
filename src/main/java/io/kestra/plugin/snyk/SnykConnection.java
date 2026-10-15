@@ -85,7 +85,7 @@ public abstract class SnykConnection extends Task {
         boolean paginate,
         boolean stopAfterFirst
     ) throws Exception {
-        List<Map<String, Object>> result = new ArrayList<>();
+        var result = new ArrayList<Map<String, Object>>();
         walkIssuePages(runContext, options, token, baseUrl, version, orgId, severities, paginate, stopAfterFirst, result::addAll);
         return result;
     }
@@ -111,14 +111,14 @@ public abstract class SnykConnection extends Task {
         requireNonBlank(token, "token");
         requireNonBlank(orgId, "orgId");
         requireNonBlank(version, "version");
-        URI base = validateBaseUrl(baseUrl);
-        String orgPath = "orgs/" + encodePathSegment(orgId) + "/issues";
-        String endpointPath = base.getRawPath().replaceAll("/+$", "") + "/" + orgPath;
+        var base = validateBaseUrl(baseUrl);
+        var orgPath = "orgs/" + encodePathSegment(orgId) + "/issues";
+        var endpointPath = base.getRawPath().replaceAll("/+$", "") + "/" + orgPath;
         var firstUrl = new StringBuilder(base.toString().replaceAll("/+$", "")).append("/").append(orgPath)
             .append("?version=").append(encode(version))
             .append("&limit=").append(ISSUES_PAGE_LIMIT);
         if (severities != null && !severities.isEmpty()) {
-            String joined = severities.stream().filter(Objects::nonNull)
+            var joined = severities.stream().filter(Objects::nonNull)
                 .map(s -> s.name().toLowerCase(Locale.ROOT)).distinct().reduce((a, b) -> a + "," + b).orElse("");
             if (!joined.isBlank()) {
                 firstUrl.append("&effective_severity_level=").append(encode(joined));
@@ -128,10 +128,10 @@ public abstract class SnykConnection extends Task {
         var visited = new HashSet<String>();
         var current = URI.create(firstUrl.toString());
         var configuration = options == null ? HttpConfiguration.builder().build() : options;
-        long total = 0L;
+        var total = 0L;
 
         try (HttpClient client = new HttpClient(runContext, configuration)) {
-            int pages = 0;
+            var pages = 0;
             while (current != null) {
                 if (++pages > MAX_PAGES) {
                     throw new IllegalStateException("Snyk pagination exceeded " + MAX_PAGES + " pages; refusing to continue.");
@@ -141,7 +141,7 @@ public abstract class SnykConnection extends Task {
                     throw new IllegalStateException("Snyk API returned a repeated pagination link; refusing to loop indefinitely.");
                 }
 
-                HttpRequest request = HttpRequest.builder()
+                var request = HttpRequest.builder()
                     .uri(current)
                     .method("GET")
                     .addHeader("Authorization", "token " + token)
@@ -153,7 +153,7 @@ public abstract class SnykConnection extends Task {
                 try {
                     response = client.request(request, String.class);
                 } catch (HttpClientResponseException e) {
-                    int status = e.getResponse() != null && e.getResponse().getStatus() != null
+                    var status = e.getResponse() != null && e.getResponse().getStatus() != null
                         ? e.getResponse().getStatus().getCode() : -1;
                     var reason = switch (status) {
                         case 401, 403 -> "Authentication/authorization failed. Verify the Snyk API token and organization access.";
@@ -179,9 +179,9 @@ public abstract class SnykConnection extends Task {
                     throw new IllegalStateException("Snyk API response is missing the expected JSON:API 'data' array.");
                 }
 
-                List<Map<String, Object>> pageIssues = new ArrayList<>();
+                var pageIssues = new ArrayList<Map<String, Object>>();
                 for (JsonNode issue : data) {
-                    Map<String, Object> row = MAPPER.convertValue(issue, new TypeReference<LinkedHashMap<String, Object>>() {});
+                    var row = MAPPER.convertValue(issue, new TypeReference<LinkedHashMap<String, Object>>() {});
                     pageIssues.add(row);
                     if (stopAfterFirst) {
                         consumer.accept(List.of(row));
@@ -202,7 +202,7 @@ public abstract class SnykConnection extends Task {
     }
 
     private static URI nextPage(JsonNode root, URI current, URI base, String endpointPath) {
-        JsonNode next = root.path("links").path("next");
+        var next = root.path("links").path("next");
         if (next.isMissingNode() || next.isNull()) {
             return null;
         }
@@ -233,7 +233,7 @@ public abstract class SnykConnection extends Task {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("baseUrl must be a valid absolute HTTP(S) URL.", e);
         }
-        String scheme = uri.getScheme();
+        var scheme = uri.getScheme();
         if (uri.getHost() == null || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null
             || !("https".equalsIgnoreCase(scheme)
                 || ("http".equalsIgnoreCase(scheme) && isLoopback(uri.getHost())))) {
