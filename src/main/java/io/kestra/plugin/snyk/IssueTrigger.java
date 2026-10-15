@@ -12,26 +12,30 @@ import io.kestra.core.models.triggers.AbstractTrigger;
 import io.kestra.core.models.triggers.PollingTriggerInterface;
 import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
-import io.kestra.core.models.triggers.TriggerService;
 import io.kestra.core.http.client.configurations.HttpConfiguration;
 import io.kestra.core.models.annotations.PluginProperty;
+import io.kestra.core.models.triggers.TriggerService;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.storages.kv.KVMetadata;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
+import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -69,9 +73,15 @@ import java.util.UUID;
 public class IssueTrigger extends AbstractTrigger implements PollingTriggerInterface, TriggerOutput<IssueTrigger.Output> {
     private static final ObjectMapper MAPPER = JacksonMapper.ofJson(false);
     private static final String KV_PREFIX = "snyk-issue-trigger-";
+    private static final int MAX_TRACKED_ISSUE_IDS = 20_000;
+    private static final int MAX_PENDING_ISSUES = 100;
+    private static final int MAX_STATE_SIZE_BYTES = 900 * 1024;
 
-    @Schema(title = "Polling interval", description = "How often Snyk is polled for issues.")
-    @lombok.Builder.Default
+    @Schema(
+        title = "Polling interval",
+        description = "How often Snyk is polled. The trigger emits one execution per evaluation, so a backlog drains at one issue per interval."
+    )
+    @Builder.Default
     private final Duration interval = Duration.ofMinutes(15);
 
     @Schema(title = "Snyk API token", description = "API token used to authenticate with Snyk. Store it as a Kestra secret.")
@@ -82,13 +92,13 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
 
     @Schema(title = "Snyk REST API base URL", description = "Regional Snyk REST API base URL.")
     @NotNull
-    @lombok.Builder.Default
+    @Builder.Default
     @PluginProperty(group = "connection")
     private Property<String> baseUrl = Property.ofValue(SnykConnection.DEFAULT_BASE_URL);
 
     @Schema(title = "Snyk REST API version", description = "API version in YYYY-MM-DD format, optionally followed by a stability suffix.")
     @NotNull
-    @lombok.Builder.Default
+    @Builder.Default
     @PluginProperty(group = "connection")
     private Property<String> apiVersion = Property.ofValue(SnykConnection.DEFAULT_VERSION);
 
@@ -117,7 +127,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
     }
 
     private Optional<Execution> evaluateInternal(ConditionContext conditionContext, TriggerContext context) throws Exception {
-        RunContext runContext = conditionContext.getRunContext();
+        var runContext = conditionContext.getRunContext();
         String renderedToken = runContext.render(token).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("token is required and must not be blank."));
@@ -129,33 +139,46 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         List<SnykConnection.Severity> renderedSeverities = severities == null ? List.of()
             : runContext.render(severities).asList(SnykConnection.Severity.class);
 
-        String key = stateKey(context);
-        State previous = loadState(runContext, context.getNamespace(), key);
+        var key = stateKey(context, renderedOrgId, renderedBaseUrl, renderedVersion, renderedSeverities);
+        var previous = loadState(runContext, context.getNamespace(), key);
         if (previous != null && !previous.pending().isEmpty()) {
-            Map<String, Object> nextIssue = previous.pending().getFirst();
-            List<Map<String, Object>> remaining = new ArrayList<>(previous.pending().subList(1, previous.pending().size()));
+            var nextIssue = previous.pending().getFirst();
+            var remaining = new ArrayList<Map<String, Object>>(previous.pending().subList(1, previous.pending().size()));
             Execution generated = execution(conditionContext, context, nextIssue);
             saveState(runContext, context.getNamespace(), key, new State(previous.knownIds(), remaining, true));
             return Optional.of(generated);
         }
 
-        Set<String> known = previous == null ? Set.of() : new LinkedHashSet<>(previous.knownIds());
-        Set<String> currentIds = new LinkedHashSet<>();
-        List<Map<String, Object>> newIssues = new ArrayList<>();
+        var known = previous == null ? Set.<String>of() : new LinkedHashSet<>(previous.knownIds());
+        var currentIds = new LinkedHashSet<String>();
+        var newIssues = new ArrayList<Map<String, Object>>();
         SnykConnection.walkIssuePages(
             runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
             renderedSeverities, true, false, page -> {
                 for (Map<String, Object> issue : page) {
-                    Object id = issue.get("id");
+                    var id = issue.get("id");
                     if (id == null || id.toString().isBlank()) {
                         throw new IllegalStateException("Snyk API returned an issue without an id; trigger state was not advanced.");
                     }
-                    String issueId = id.toString();
+                    var issueId = id.toString();
                     // Cursor pagination can overlap when the underlying issue collection changes between pages.
                     // Only enqueue an ID once per snapshot, even if it appears on multiple pages.
                     boolean firstOccurrence = currentIds.add(issueId);
+                    if (currentIds.size() > MAX_TRACKED_ISSUE_IDS) {
+                        throw new IllegalStateException(
+                            "Snyk IssueTrigger found more than " + MAX_TRACKED_ISSUE_IDS + " issues for this filter. " +
+                                "Trigger state was not advanced; narrow the severity filter or use ListIssues for full exports."
+                        );
+                    }
                     if (firstOccurrence && previous != null && previous.initialized() && !known.contains(issueId)) {
                         newIssues.add(issue);
+                        if (newIssues.size() > MAX_PENDING_ISSUES) {
+                            throw new IllegalStateException(
+                                "Snyk IssueTrigger detected more than " + MAX_PENDING_ISSUES + " new issues in one poll. " +
+                                    "Trigger state was not advanced to avoid dropping issues or writing an oversized queue; " +
+                                    "narrow the severity filter and retry. Pending issues are emitted one per polling interval."
+                            );
+                        }
                     }
                 }
             }
@@ -172,7 +195,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
             return Optional.empty();
         }
 
-        Map<String, Object> first = newIssues.getFirst();
+        var first = newIssues.getFirst();
         List<Map<String, Object>> remaining = new ArrayList<>(newIssues.subList(1, newIssues.size()));
         Execution generated = execution(conditionContext, context, first);
         saveState(runContext, context.getNamespace(), key, new State(List.copyOf(currentIds), remaining, true));
@@ -191,9 +214,28 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         );
     }
 
-    private static String stateKey(TriggerContext context) {
-        String identity = context.getFlowId() + "\n" + context.getTriggerId();
-        return KV_PREFIX + UUID.nameUUIDFromBytes(identity.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    private static String stateKey(
+        TriggerContext context,
+        String orgId,
+        String baseUrl,
+        String apiVersion,
+        List<SnykConnection.Severity> severities
+    ) {
+        var severityKey = severities == null ? "" : severities.stream()
+            .filter(Objects::nonNull)
+            .map(Enum::name)
+            .sorted()
+            .collect(Collectors.joining(","));
+        var normalizedBaseUrl = baseUrl == null ? "" : baseUrl.trim().replaceAll("/+$", "");
+        var identity = String.join("\n",
+            context.getFlowId(),
+            context.getTriggerId(),
+            orgId,
+            normalizedBaseUrl,
+            apiVersion,
+            severityKey
+        );
+        return KV_PREFIX + UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8));
     }
 
     private static State loadState(RunContext runContext, String namespace, String key) throws Exception {
@@ -214,11 +256,23 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
     }
 
     private static void saveState(RunContext runContext, String namespace, String key, State state) throws Exception {
-        String value = MAPPER.writeValueAsString(Map.of(
+        if (state.knownIds().size() > MAX_TRACKED_ISSUE_IDS) {
+            throw new IllegalStateException("Snyk IssueTrigger state exceeds the limit of " + MAX_TRACKED_ISSUE_IDS + " tracked issue IDs.");
+        }
+        if (state.pending().size() > MAX_PENDING_ISSUES) {
+            throw new IllegalStateException("Snyk IssueTrigger pending queue exceeds the limit of " + MAX_PENDING_ISSUES + " issues.");
+        }
+        var value = MAPPER.writeValueAsString(Map.of(
             "knownIds", state.knownIds(),
             "pending", state.pending(),
             "initialized", state.initialized()
         ));
+        if (value.getBytes(StandardCharsets.UTF_8).length > MAX_STATE_SIZE_BYTES) {
+            throw new IllegalStateException(
+                "Snyk IssueTrigger state exceeds the safe namespace key-value payload size of " + MAX_STATE_SIZE_BYTES +
+                    " bytes. Narrow the severity filter; trigger state was not advanced."
+            );
+        }
         runContext.namespaceKv(namespace).put(
             key,
             new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", (Duration) null), value),
@@ -228,8 +282,9 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
 
     private record State(List<String> knownIds, List<Map<String, Object>> pending, boolean initialized) {}
 
-    @lombok.Builder
+    @Builder
     @Getter
+    @Schema(title = "Snyk issue trigger output", description = "Issue details for the Snyk issue that caused this execution.")
     public static class Output implements io.kestra.core.models.tasks.Output {
         @Schema(title = "Snyk issue ID", description = "Identifier of the issue that caused this execution.")
         private final String issueId;

@@ -18,7 +18,7 @@ The HTTP client supports Kestra HTTP configuration options. HTTPS is required fo
 
 ## ListIssues
 
-`io.kestra.plugin.snyk.ListIssues` lists issues from `GET /orgs/{org_id}/issues`. It follows Snyk's cursor pagination links for `FETCH`, `STORE`, and `NONE` modes. The API's `effective_severity_level` filter is used when one or more severities are configured.
+`io.kestra.plugin.snyk.ListIssues` lists issues from `GET /orgs/{org_id}/issues`. It requests up to 100 issues per page and follows Snyk's cursor pagination links for `FETCH`, `STORE`, and `NONE` modes. The API's `effective_severity_level` filter is used when one or more severities are configured.
 
 ### Fetch all critical and high-severity issues
 
@@ -50,7 +50,9 @@ Use `STORE` for large result sets to avoid returning all issue records as task o
 
 `io.kestra.plugin.snyk.IssueTrigger` polls the organization on the configured `interval` (default `PT15M`). Its first successful poll establishes a baseline of existing issue IDs to avoid firing once for every historical issue. Later polls emit one execution for each newly detected issue, with `trigger.issueId` and the complete JSON:API issue object in `trigger.issue`.
 
-The trigger stores its baseline and pending issue queue in namespace key-value storage. It processes a pending queue before fetching another snapshot, so a burst of new issues is emitted one execution at a time rather than being collapsed into one execution.
+The trigger stores its baseline and pending issue queue in namespace key-value storage. State is isolated by flow, trigger, organization, API endpoint/version, and severity filter; changing the organization or filter establishes a fresh baseline rather than treating historical issues as new.
+
+The trigger emits **one execution per polling evaluation**. When a burst creates a backlog, pending issues are drained one per interval (at the default `PT15M`, 40 queued issues can take up to 10 hours to drain). To prevent unbounded key-value state, one snapshot is limited to 20,000 tracked issue IDs, a pending queue to 100 new issues, and the serialized state to 900 KiB. If a limit is exceeded, the trigger fails clearly without advancing the state or silently dropping issues. Narrow the severity filter to reduce the snapshot/backlog, and use `ListIssues` for full exports.
 
 ### Alert on new critical issues
 
@@ -75,7 +77,7 @@ tasks:
 
 ## API behavior and errors
 
-- Requests use the configured API version and JSON:API content type.
+- Requests use the configured API version, JSON:API content type, and `limit=100` (the documented maximum for this endpoint).
 - Pagination links are followed only when they remain on the configured API origin and the same organization issues endpoint.
 - Repeated pagination links and excessive page counts fail explicitly rather than looping forever.
 - Empty or malformed response bodies and responses missing the JSON:API `data` array fail explicitly.

@@ -43,6 +43,7 @@ class ListIssuesTest {
         stubFor(get(urlPathEqualTo(PATH))
             .withQueryParam("version", equalTo("2024-10-15"))
             .withQueryParam("effective_severity_level", equalTo("critical,high"))
+            .withQueryParam("limit", equalTo("100"))
             .withHeader("Authorization", equalTo("token test-token"))
             .withHeader("Accept", equalTo("application/vnd.api+json"))
             .willReturn(okJson("""
@@ -311,6 +312,116 @@ class ListIssuesTest {
         assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
             "unchanged snapshot should not trigger duplicates");
         verify(4, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void triggerStateIsIsolatedByOrganizationAndSeverityConfiguration() throws Exception {
+        String flowId = "snyk-config-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        String triggerId = "snyk-config-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder()
+            .id(flowId)
+            .namespace("company.security")
+            .tenantId("test-tenant")
+            .build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
+            {"data":[{"id":"baseline","type":"issue"}],"links":{}}
+            """)));
+        var baselineTrigger = configuredTrigger(triggerId, "org-id", List.of());
+        var baselineRunContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, baselineTrigger), triggerContext, baselineTrigger
+        );
+        var baselineCondition = ConditionContext.builder().runContext(baselineRunContext).flow(flow).build();
+        assertTrue(baselineTrigger.evaluate(baselineCondition, triggerContext).isEmpty());
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .withQueryParam("effective_severity_level", equalTo("critical"))
+            .willReturn(okJson("""
+                {"data":[{"id":"historical-critical","type":"issue"}],"links":{}}
+                """)));
+        var criticalTrigger = configuredTrigger(triggerId, "org-id", List.of(SnykConnection.Severity.CRITICAL));
+        var criticalRunContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, criticalTrigger), triggerContext, criticalTrigger
+        );
+        var criticalCondition = ConditionContext.builder().runContext(criticalRunContext).flow(flow).build();
+        assertTrue(criticalTrigger.evaluate(criticalCondition, triggerContext).isEmpty(),
+            "changing severity filter must establish a new baseline rather than emit historical matching issues");
+
+        stubFor(get(urlPathEqualTo("/rest/orgs/other-org/issues")).willReturn(okJson("""
+            {"data":[{"id":"historical-other-org","type":"issue"}],"links":{}}
+            """)));
+        var otherOrgTrigger = configuredTrigger(triggerId, "other-org", List.of());
+        var otherOrgRunContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, otherOrgTrigger), triggerContext, otherOrgTrigger
+        );
+        var otherOrgCondition = ConditionContext.builder().runContext(otherOrgRunContext).flow(flow).build();
+        assertTrue(otherOrgTrigger.evaluate(otherOrgCondition, triggerContext).isEmpty(),
+            "changing organization must establish a new baseline rather than emit historical issues");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void failsClearlyInsteadOfPersistingMoreThanOneHundredPendingIssues() throws Exception {
+        String flowId = "snyk-backlog-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        String triggerId = "snyk-backlog-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder()
+            .id(flowId)
+            .namespace("company.security")
+            .tenantId("test-tenant")
+            .build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        String issues = java.util.stream.IntStream.range(0, 101)
+            .mapToObj(i -> "{\"id\":\"new-" + i + "\",\"type\":\"issue\"}")
+            .collect(java.util.stream.Collectors.joining(","));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-large-backlog")
+            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("large-backlog"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-large-backlog")
+            .whenScenarioStateIs("large-backlog")
+            .willReturn(okJson("{\"data\":[" + issues + "],\"links\":{}}")));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+        assertTrue(error.getCause().getMessage().contains("more than 100 new issues"));
+    }
+
+    private IssueTrigger configuredTrigger(String triggerId, String orgId, List<SnykConnection.Severity> severities) {
+        return IssueTrigger.builder()
+            .id(triggerId)
+            .type(IssueTrigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .baseUrl(Property.ofValue(BASE_URL))
+            .apiVersion(Property.ofValue("2024-10-15"))
+            .orgId(Property.ofValue(orgId))
+            .severities(Property.ofValue(severities))
+            .interval(Duration.ofMinutes(15))
+            .build();
     }
 
     private ListIssues task(FetchType fetchType, boolean highAndCritical) {

@@ -2,6 +2,7 @@ package io.kestra.plugin.snyk;
 
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
+import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.models.tasks.common.FetchOutput;
@@ -10,6 +11,7 @@ import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.FileSerde;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
+import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -72,32 +74,32 @@ import java.util.Map;
 public class ListIssues extends SnykConnection implements RunnableTask<FetchOutput> {
     @Schema(title = "Snyk organization ID", description = "The Snyk organization whose issues should be retrieved.")
     @NotNull
-    @io.kestra.core.models.annotations.PluginProperty(group = "main")
+    @PluginProperty(group = "main")
     private Property<String> orgId;
 
     @Schema(title = "Severity levels", description = "Optional severity filter. If omitted, issues of every severity are returned.")
-    @io.kestra.core.models.annotations.PluginProperty(group = "processing")
+    @PluginProperty(group = "processing")
     private Property<List<Severity>> severities;
 
     @Schema(title = "Fetch mode", description = "FETCH returns all rows, FETCH_ONE returns the first row, STORE writes all rows to internal storage, and NONE returns only the count.")
     @NotNull
-    @lombok.Builder.Default
-    @io.kestra.core.models.annotations.PluginProperty(group = "processing")
+    @Builder.Default
+    @PluginProperty(group = "processing")
     private Property<FetchType> fetchType = Property.ofValue(FetchType.FETCH);
 
     @Override
     public FetchOutput run(RunContext runContext) throws Exception {
-        String renderedToken = runContext.render(token).as(String.class)
+        var renderedToken = runContext.render(token).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("token is required and must not be blank."));
-        String renderedBaseUrl = runContext.render(baseUrl).as(String.class).orElse(DEFAULT_BASE_URL);
-        String renderedVersion = runContext.render(apiVersion).as(String.class).orElse(DEFAULT_VERSION);
-        String renderedOrgId = runContext.render(orgId).as(String.class)
+        var renderedBaseUrl = runContext.render(baseUrl).as(String.class).orElse(DEFAULT_BASE_URL);
+        var renderedVersion = runContext.render(apiVersion).as(String.class).orElse(DEFAULT_VERSION);
+        var renderedOrgId = runContext.render(orgId).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("orgId is required and must not be blank."));
-        List<Severity> renderedSeverities = severities == null ? List.of()
+        var renderedSeverities = severities == null ? List.of()
             : runContext.render(severities).asList(Severity.class);
-        FetchType mode = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.FETCH);
+        var mode = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.FETCH);
 
         return switch (mode) {
             case FETCH_ONE -> {
@@ -136,7 +138,7 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
         String renderedOrgId,
         List<Severity> renderedSeverities
     ) throws Exception {
-        File tempFile = runContext.workingDir().createTempFile(".ion").toFile();
+        var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
         long count;
         try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
             count = SnykConnection.walkIssuePages(

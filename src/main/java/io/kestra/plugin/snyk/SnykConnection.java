@@ -1,6 +1,7 @@
 package io.kestra.plugin.snyk;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.kestra.core.http.HttpRequest;
 import io.kestra.core.http.HttpResponse;
@@ -14,6 +15,7 @@ import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
+import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -30,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /** Shared Snyk connection properties and REST API handling. */
@@ -41,8 +44,9 @@ import java.util.Set;
 public abstract class SnykConnection extends Task {
     public static final String DEFAULT_BASE_URL = "https://api.snyk.io/rest";
     public static final String DEFAULT_VERSION = "2024-10-15";
-    private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER = JacksonMapper.ofJson(false);
+    private static final ObjectMapper MAPPER = JacksonMapper.ofJson(false);
     private static final int MAX_PAGES = 10_000;
+    private static final int ISSUES_PAGE_LIMIT = 100;
 
     @Schema(title = "Snyk API token", description = "API token used to authenticate with Snyk. Store it as a Kestra secret.")
     @NotNull
@@ -52,13 +56,13 @@ public abstract class SnykConnection extends Task {
 
     @Schema(title = "Snyk REST API base URL", description = "Regional Snyk REST API base URL. Defaults to https://api.snyk.io/rest.")
     @NotNull
-    @lombok.Builder.Default
+    @Builder.Default
     @PluginProperty(group = "connection")
     protected Property<String> baseUrl = Property.ofValue(DEFAULT_BASE_URL);
 
     @Schema(title = "Snyk REST API version", description = "API version in YYYY-MM-DD format, optionally followed by a stability suffix.")
     @NotNull
-    @lombok.Builder.Default
+    @Builder.Default
     @PluginProperty(group = "connection")
     protected Property<String> apiVersion = Property.ofValue(DEFAULT_VERSION);
 
@@ -110,19 +114,20 @@ public abstract class SnykConnection extends Task {
         URI base = validateBaseUrl(baseUrl);
         String orgPath = "orgs/" + encodePathSegment(orgId) + "/issues";
         String endpointPath = base.getRawPath().replaceAll("/+$", "") + "/" + orgPath;
-        StringBuilder firstUrl = new StringBuilder(base.toString().replaceAll("/+$", "")).append("/").append(orgPath)
-            .append("?version=").append(encode(version));
+        var firstUrl = new StringBuilder(base.toString().replaceAll("/+$", "")).append("/").append(orgPath)
+            .append("?version=").append(encode(version))
+            .append("&limit=").append(ISSUES_PAGE_LIMIT);
         if (severities != null && !severities.isEmpty()) {
-            String joined = severities.stream().filter(java.util.Objects::nonNull)
+            String joined = severities.stream().filter(Objects::nonNull)
                 .map(s -> s.name().toLowerCase(Locale.ROOT)).distinct().reduce((a, b) -> a + "," + b).orElse("");
             if (!joined.isBlank()) {
                 firstUrl.append("&effective_severity_level=").append(encode(joined));
             }
         }
 
-        Set<String> visited = new HashSet<>();
-        URI current = URI.create(firstUrl.toString());
-        HttpConfiguration configuration = options == null ? HttpConfiguration.builder().build() : options;
+        var visited = new HashSet<String>();
+        var current = URI.create(firstUrl.toString());
+        var configuration = options == null ? HttpConfiguration.builder().build() : options;
         long total = 0L;
 
         try (HttpClient client = new HttpClient(runContext, configuration)) {
@@ -131,7 +136,7 @@ public abstract class SnykConnection extends Task {
                 if (++pages > MAX_PAGES) {
                     throw new IllegalStateException("Snyk pagination exceeded " + MAX_PAGES + " pages; refusing to continue.");
                 }
-                String canonical = current.normalize().toString();
+                var canonical = current.normalize().toString();
                 if (!visited.add(canonical)) {
                     throw new IllegalStateException("Snyk API returned a repeated pagination link; refusing to loop indefinitely.");
                 }
@@ -150,7 +155,7 @@ public abstract class SnykConnection extends Task {
                 } catch (HttpClientResponseException e) {
                     int status = e.getResponse() != null && e.getResponse().getStatus() != null
                         ? e.getResponse().getStatus().getCode() : -1;
-                    String reason = switch (status) {
+                    var reason = switch (status) {
                         case 401, 403 -> "Authentication/authorization failed. Verify the Snyk API token and organization access.";
                         case 404 -> "Organization or endpoint was not found. Verify orgId and baseUrl.";
                         case 429 -> "Snyk rate limit was exceeded. Retry after the rate-limit window.";
@@ -159,7 +164,7 @@ public abstract class SnykConnection extends Task {
                     throw new IllegalStateException(reason + " HTTP status: " + status + ".", e);
                 }
 
-                String body = response.getBody();
+                var body = response.getBody();
                 if (body == null || body.isBlank()) {
                     throw new IllegalStateException("Snyk API returned an empty response body.");
                 }
@@ -169,7 +174,7 @@ public abstract class SnykConnection extends Task {
                 } catch (IOException e) {
                     throw new IllegalStateException("Snyk API returned invalid JSON.", e);
                 }
-                JsonNode data = root.get("data");
+                var data = root.get("data");
                 if (data == null || !data.isArray()) {
                     throw new IllegalStateException("Snyk API response is missing the expected JSON:API 'data' array.");
                 }
@@ -212,7 +217,7 @@ public abstract class SnykConnection extends Task {
         if (value.isBlank()) {
             return null;
         }
-        URI candidate = current.resolve(value);
+        var candidate = current.resolve(value);
         if (candidate.getUserInfo() != null || candidate.getFragment() != null
             || !sameOrigin(base, candidate) || !candidate.getRawPath().equals(endpointPath)) {
             throw new IllegalStateException("Snyk API returned an unsafe pagination link outside the configured issues endpoint.");
