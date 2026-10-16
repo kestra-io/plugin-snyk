@@ -368,8 +368,8 @@ class ListIssuesTest {
     }
 
     @Test
-    @Timeout(value = 35, unit = TimeUnit.SECONDS)
-    void failsClearlyInsteadOfPersistingMoreThanOneHundredPendingIssues() throws Exception {
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void pendingOverflowIsQueuedInBatchesAndPickedUpByLaterPolls() throws Exception {
         String flowId = "snyk-backlog-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         String triggerId = "snyk-backlog-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         var flow = Flow.builder()
@@ -405,10 +405,44 @@ class ListIssuesTest {
             (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
         );
         var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
-        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(), "initial poll establishes the baseline");
 
-        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
-        assertTrue(error.getCause().getMessage().contains("more than 100 new issues"));
+        var first = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(first.isPresent());
+        assertEquals("new-0", ((Map<?, ?>) first.get().getTrigger().getVariables()).get("issueId"));
+
+        // The first 100 issues are emitted individually. The 101st ID is not marked known,
+        // so a later scan discovers it after the pending queue drains.
+        for (int expected = 1; expected < 100; expected++) {
+            var next = trigger.evaluate(conditionContext, triggerContext);
+            assertTrue(next.isPresent(), "queued issue new-" + expected + " should be emitted");
+            assertEquals("new-" + expected, ((Map<?, ?>) next.get().getTrigger().getVariables()).get("issueId"));
+        }
+        var overflow = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(overflow.isPresent(), "overflow issue should be picked up by a later scan rather than deadlocking polling");
+        assertEquals("new-100", ((Map<?, ?>) overflow.get().getTrigger().getVariables()).get("issueId"));
+        verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    void knownIssueIdsAreSplitIntoBoundedKvShards() throws Exception {
+        var ids = java.util.stream.IntStream.range(0, IssueTrigger.MAX_IDS_PER_STATE_SHARD + 1)
+            .mapToObj(i -> "issue-" + i)
+            .toList();
+        var shards = IssueTrigger.chunkKnownIds(ids);
+        assertEquals(2, shards.size());
+        assertEquals(IssueTrigger.MAX_IDS_PER_STATE_SHARD, shards.getFirst().size());
+        assertEquals(1, shards.getLast().size());
+        assertEquals(ids, shards.stream().flatMap(List::stream).toList());
+    }
+
+    @Test
+    void stateTtlIsFourPollingIntervalsAndShardTtlLeavesCleanupMargin() {
+        assertEquals(Duration.ofHours(1), IssueTrigger.stateTtl(Duration.ofMinutes(15)));
+        assertEquals(Duration.ofMinutes(75), IssueTrigger.stateShardTtl(Duration.ofMinutes(15)));
+        assertEquals(Duration.ofHours(1), IssueTrigger.stateTtl(Duration.ZERO),
+            "invalid zero intervals get a safe finite TTL rather than immortal or immediately expired state");
+        assertEquals(Duration.ofHours(1).plusMinutes(1), IssueTrigger.stateShardTtl(Duration.ZERO));
     }
 
     private IssueTrigger configuredTrigger(String triggerId, String orgId, List<SnykConnection.Severity> severities) {
