@@ -47,6 +47,12 @@ public abstract class SnykConnection extends Task {
     private static final ObjectMapper MAPPER = JacksonMapper.ofJson(false);
     private static final int MAX_PAGES = 10_000;
     private static final int ISSUES_PAGE_LIMIT = 100;
+    private static final Set<String> SNYK_API_HOSTS = Set.of(
+        "api.snyk.io",
+        "api.us.snyk.io",
+        "api.eu.snyk.io",
+        "api.au.snyk.io"
+    );
 
     @Schema(title = "Snyk API token", description = "API token used to authenticate with Snyk. Store it as a Kestra secret.")
     @NotNull
@@ -54,7 +60,7 @@ public abstract class SnykConnection extends Task {
     @ToString.Exclude
     protected Property<String> token;
 
-    @Schema(title = "Snyk REST API base URL", description = "Regional Snyk REST API base URL. Defaults to https://api.snyk.io/rest.")
+    @Schema(title = "Snyk REST API base URL", description = "Official regional Snyk REST API base URL (api.snyk.io, api.us.snyk.io, api.eu.snyk.io, or api.au.snyk.io). Defaults to https://api.snyk.io/rest.")
     @NotNull
     @Builder.Default
     @PluginProperty(group = "connection")
@@ -225,7 +231,7 @@ public abstract class SnykConnection extends Task {
         return candidate;
     }
 
-    private static URI validateBaseUrl(String raw) {
+    static URI validateBaseUrl(String raw) {
         requireNonBlank(raw, "baseUrl");
         URI uri;
         try {
@@ -234,10 +240,17 @@ public abstract class SnykConnection extends Task {
             throw new IllegalArgumentException("baseUrl must be a valid absolute HTTP(S) URL.", e);
         }
         var scheme = uri.getScheme();
+        var host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.ROOT);
+        var officialSnykHttpsUrl = "https".equalsIgnoreCase(scheme)
+            && SNYK_API_HOSTS.contains(host)
+            && (uri.getPort() == -1 || uri.getPort() == 443);
+        var loopbackHttpUrl = "http".equalsIgnoreCase(scheme) && isLoopback(host);
         if (uri.getHost() == null || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null
-            || !("https".equalsIgnoreCase(scheme)
-                || ("http".equalsIgnoreCase(scheme) && isLoopback(uri.getHost())))) {
-            throw new IllegalArgumentException("baseUrl must be an HTTPS URL (HTTP is allowed only for localhost WireMock tests) without credentials, query, or fragment.");
+            || !(officialSnykHttpsUrl || loopbackHttpUrl)) {
+            throw new IllegalArgumentException(
+                "baseUrl must be an HTTPS URL using an official Snyk API host (api.snyk.io, api.us.snyk.io, api.eu.snyk.io, or api.au.snyk.io). "
+                    + "HTTP is allowed only for loopback WireMock tests; credentials, query, fragment, and custom remote ports are not allowed."
+            );
         }
         return uri;
     }

@@ -196,6 +196,21 @@ class ListIssuesTest {
     }
 
     @Test
+    void onlyOfficialSnykHttpsHostsAreAccepted() {
+        for (var host : List.of("api.snyk.io", "api.us.snyk.io", "api.eu.snyk.io", "api.au.snyk.io")) {
+            assertDoesNotThrow(() -> SnykConnection.validateBaseUrl("https://" + host + "/rest"), host);
+        }
+
+        var nonSnyk = assertThrows(IllegalArgumentException.class,
+            () -> SnykConnection.validateBaseUrl("https://api.snyk.io.attacker.example/rest"));
+        assertTrue(nonSnyk.getMessage().contains("official Snyk API host"));
+
+        var customPort = assertThrows(IllegalArgumentException.class,
+            () -> SnykConnection.validateBaseUrl("https://api.snyk.io:8443/rest"));
+        assertTrue(customPort.getMessage().contains("custom remote ports"));
+    }
+
+    @Test
     void repeatedPaginationLinkFailsInsteadOfLooping() {
         stubFor(get(urlPathEqualTo(PATH))
             .willReturn(okJson("""

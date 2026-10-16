@@ -14,7 +14,7 @@ Store the Snyk API token in a Kestra secret and reference it with `{{ secret('SN
 | `orgId` | Required | Snyk organization ID |
 | `severities` | All severities | Optional list of `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW` |
 
-The HTTP client supports Kestra HTTP configuration options. HTTPS is required for remote API hosts. HTTP is accepted only for loopback addresses to support local WireMock tests.
+The HTTP client supports Kestra HTTP configuration options. Remote URLs must use one of Snyk's official regional API hosts: `api.snyk.io`, `api.us.snyk.io`, `api.eu.snyk.io`, or `api.au.snyk.io` over HTTPS on the default port. HTTP is accepted only for loopback addresses to support local WireMock tests.
 
 ## ListIssues
 
