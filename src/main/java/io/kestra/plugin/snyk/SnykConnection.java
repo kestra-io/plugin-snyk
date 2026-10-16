@@ -1,8 +1,8 @@
 package io.kestra.plugin.snyk;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.kestra.core.http.HttpRequest;
 import io.kestra.core.http.HttpResponse;
 import io.kestra.core.http.client.HttpClient;
@@ -54,25 +54,33 @@ public abstract class SnykConnection extends Task {
         "api.au.snyk.io"
     );
 
-    @Schema(title = "Snyk API token", description = "API token used to authenticate with Snyk. Store it as a Kestra secret.")
+    @Schema(title = "Snyk API token", description = """
+        API token used to authenticate with Snyk. Store it as a Kestra secret.
+        """)
     @NotNull
     @PluginProperty(secret = true, group = "connection")
     @ToString.Exclude
     protected Property<String> token;
 
-    @Schema(title = "Snyk REST API base URL", description = "Official regional Snyk REST API base URL (api.snyk.io, api.us.snyk.io, api.eu.snyk.io, or api.au.snyk.io). Defaults to https://api.snyk.io/rest.")
+    @Schema(title = "Snyk REST API base URL", description = """
+        Official regional Snyk REST API base URL (api.snyk.io, api.us.snyk.io, api.eu.snyk.io, or api.au.snyk.io). Defaults to https://api.snyk.io/rest.
+        """)
     @NotNull
     @Builder.Default
     @PluginProperty(group = "connection")
     protected Property<String> baseUrl = Property.ofValue(DEFAULT_BASE_URL);
 
-    @Schema(title = "Snyk REST API version", description = "API version in YYYY-MM-DD format, optionally followed by a stability suffix.")
+    @Schema(title = "Snyk REST API version", description = """
+        API version in YYYY-MM-DD format, optionally followed by a stability suffix. Defaults to `2024-10-15`.
+        """)
     @NotNull
     @Builder.Default
     @PluginProperty(group = "connection")
     protected Property<String> apiVersion = Property.ofValue(DEFAULT_VERSION);
 
-    @Schema(title = "HTTP client options", description = "Optional HTTP settings such as timeouts, proxy, and TLS.")
+    @Schema(title = "HTTP client options", description = """
+        Optional HTTP settings such as timeouts, proxy, and TLS.
+        """)
     @PluginProperty(group = "advanced")
     protected HttpConfiguration options;
 
@@ -83,16 +91,16 @@ public abstract class SnykConnection extends Task {
     public static List<Map<String, Object>> fetchIssues(
         RunContext runContext,
         HttpConfiguration options,
-        String token,
-        String baseUrl,
-        String version,
-        String orgId,
-        List<Severity> severities,
+        String rToken,
+        String rBaseUrl,
+        String rVersion,
+        String rOrgId,
+        List<Severity> rSeverities,
         boolean paginate,
         boolean stopAfterFirst
     ) throws Exception {
         var result = new ArrayList<Map<String, Object>>();
-        walkIssuePages(runContext, options, token, baseUrl, version, orgId, severities, paginate, stopAfterFirst, result::addAll);
+        walkIssuePages(runContext, options, rToken, rBaseUrl, rVersion, rOrgId, rSeverities, paginate, stopAfterFirst, result::addAll);
         return result;
     }
 
@@ -105,26 +113,26 @@ public abstract class SnykConnection extends Task {
     public static long walkIssuePages(
         RunContext runContext,
         HttpConfiguration options,
-        String token,
-        String baseUrl,
-        String version,
-        String orgId,
-        List<Severity> severities,
+        String rToken,
+        String rBaseUrl,
+        String rVersion,
+        String rOrgId,
+        List<Severity> rSeverities,
         boolean paginate,
         boolean stopAfterFirst,
         IssuePageConsumer consumer
     ) throws Exception {
-        requireNonBlank(token, "token");
-        requireNonBlank(orgId, "orgId");
-        requireNonBlank(version, "version");
-        var base = validateBaseUrl(baseUrl);
-        var orgPath = "orgs/" + encodePathSegment(orgId) + "/issues";
+        requireNonBlank(rToken, "token");
+        requireNonBlank(rOrgId, "orgId");
+        requireNonBlank(rVersion, "version");
+        var base = validateBaseUrl(rBaseUrl);
+        var orgPath = "orgs/" + encodePathSegment(rOrgId) + "/issues";
         var endpointPath = base.getRawPath().replaceAll("/+$", "") + "/" + orgPath;
         var firstUrl = new StringBuilder(base.toString().replaceAll("/+$", "")).append("/").append(orgPath)
-            .append("?version=").append(encode(version))
+            .append("?version=").append(encode(rVersion))
             .append("&limit=").append(ISSUES_PAGE_LIMIT);
-        if (severities != null && !severities.isEmpty()) {
-            var joined = severities.stream().filter(Objects::nonNull)
+        if (rSeverities != null && !rSeverities.isEmpty()) {
+            var joined = rSeverities.stream().filter(Objects::nonNull)
                 .map(s -> s.name().toLowerCase(Locale.ROOT)).distinct().reduce((a, b) -> a + "," + b).orElse("");
             if (!joined.isBlank()) {
                 firstUrl.append("&effective_severity_level=").append(encode(joined));
@@ -150,36 +158,18 @@ public abstract class SnykConnection extends Task {
                 var request = HttpRequest.builder()
                     .uri(current)
                     .method("GET")
-                    .addHeader("Authorization", "token " + token)
+                    .addHeader("Authorization", "token " + rToken)
                     .addHeader("Accept", "application/vnd.api+json")
                     .addHeader("Content-Type", "application/vnd.api+json")
                     .build();
 
-                HttpResponse<String> response;
-                try {
-                    response = client.request(request, String.class);
-                } catch (HttpClientResponseException e) {
-                    var status = e.getResponse() != null && e.getResponse().getStatus() != null
-                        ? e.getResponse().getStatus().getCode() : -1;
-                    var reason = switch (status) {
-                        case 401, 403 -> "Authentication/authorization failed. Verify the Snyk API token and organization access.";
-                        case 404 -> "Organization or endpoint was not found. Verify orgId and baseUrl.";
-                        case 429 -> "Snyk rate limit was exceeded. Retry after the rate-limit window.";
-                        default -> "Snyk API request failed.";
-                    };
-                    throw new IllegalStateException(reason + " HTTP status: " + status + ".", e);
-                }
+                var response = requestPage(client, request);
 
                 var body = response.getBody();
                 if (body == null || body.isBlank()) {
                     throw new IllegalStateException("Snyk API returned an empty response body.");
                 }
-                JsonNode root;
-                try {
-                    root = MAPPER.readTree(body);
-                } catch (IOException e) {
-                    throw new IllegalStateException("Snyk API returned invalid JSON.", e);
-                }
+                var root = parseJsonBody(body);
                 var data = root.get("data");
                 if (data == null || !data.isArray()) {
                     throw new IllegalStateException("Snyk API response is missing the expected JSON:API 'data' array.");
@@ -207,6 +197,30 @@ public abstract class SnykConnection extends Task {
         return total;
     }
 
+    private static HttpResponse<String> requestPage(HttpClient client, HttpRequest request) throws Exception {
+        try {
+            return client.request(request, String.class);
+        } catch (HttpClientResponseException e) {
+            var status = e.getResponse() != null && e.getResponse().getStatus() != null
+                ? e.getResponse().getStatus().getCode() : -1;
+            var reason = switch (status) {
+                case 401, 403 -> "Authentication/authorization failed. Verify the Snyk API token and organization access.";
+                case 404 -> "Organization or endpoint was not found. Verify orgId and baseUrl.";
+                case 429 -> "Snyk rate limit was exceeded. Retry after the rate-limit window.";
+                default -> "Snyk API request failed.";
+            };
+            throw new IllegalStateException(reason + " HTTP status: " + status + ".", e);
+        }
+    }
+
+    private static JsonNode parseJsonBody(String body) {
+        try {
+            return MAPPER.readTree(body);
+        } catch (IOException e) {
+            throw new IllegalStateException("Snyk API returned invalid JSON.", e);
+        }
+    }
+
     private static URI nextPage(JsonNode root, URI current, URI base, String endpointPath) {
         var next = root.path("links").path("next");
         if (next.isMissingNode() || next.isNull()) {
@@ -231,11 +245,11 @@ public abstract class SnykConnection extends Task {
         return candidate;
     }
 
-    static URI validateBaseUrl(String raw) {
-        requireNonBlank(raw, "baseUrl");
+    static URI validateBaseUrl(String rBaseUrl) {
+        requireNonBlank(rBaseUrl, "baseUrl");
         URI uri;
         try {
-            uri = URI.create(raw.trim());
+            uri = URI.create(rBaseUrl.trim());
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("baseUrl must be a valid absolute HTTP(S) URL.", e);
         }

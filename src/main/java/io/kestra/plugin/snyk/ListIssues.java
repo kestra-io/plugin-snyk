@@ -20,9 +20,7 @@ import lombok.experimental.SuperBuilder;
 import reactor.core.publisher.Flux;
 
 import java.io.BufferedOutputStream;
-import java.io.File;
 import java.io.FileOutputStream;
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,7 +30,9 @@ import java.util.Map;
 @EqualsAndHashCode
 @Getter
 @NoArgsConstructor
-@Schema(title = "List Snyk issues", description = "Lists security issues for a Snyk organization using the Snyk REST API.")
+@Schema(title = "List Snyk issues", description = """
+        Lists security issues for a Snyk organization using the Snyk REST API.
+        """)
 @Plugin(
     examples = {
         @Example(
@@ -72,16 +72,22 @@ import java.util.Map;
     }
 )
 public class ListIssues extends SnykConnection implements RunnableTask<FetchOutput> {
-    @Schema(title = "Snyk organization ID", description = "The Snyk organization whose issues should be retrieved.")
+    @Schema(title = "Snyk organization ID", description = """
+        The Snyk organization whose issues should be retrieved.
+        """)
     @NotNull
     @PluginProperty(group = "main")
     private Property<String> orgId;
 
-    @Schema(title = "Severity levels", description = "Optional severity filter. If omitted, issues of every severity are returned.")
+    @Schema(title = "Severity levels", description = """
+        Optional severity filter. If omitted, issues of every severity are returned.
+        """)
     @PluginProperty(group = "processing")
     private Property<List<Severity>> severities;
 
-    @Schema(title = "Fetch mode", description = "FETCH returns all rows, FETCH_ONE returns the first row, STORE writes all rows to internal storage, and NONE returns only the count.")
+    @Schema(title = "Fetch mode", description = """
+        FETCH returns all rows, FETCH_ONE returns the first row, STORE writes all rows to internal storage, and NONE returns only the count. Defaults to FETCH.
+        """)
     @NotNull
     @Builder.Default
     @PluginProperty(group = "processing")
@@ -89,23 +95,23 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
 
     @Override
     public FetchOutput run(RunContext runContext) throws Exception {
-        var renderedToken = runContext.render(token).as(String.class)
+        var rToken = runContext.render(token).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("token is required and must not be blank."));
-        var renderedBaseUrl = runContext.render(baseUrl).as(String.class).orElse(DEFAULT_BASE_URL);
-        var renderedVersion = runContext.render(apiVersion).as(String.class).orElse(DEFAULT_VERSION);
-        var renderedOrgId = runContext.render(orgId).as(String.class)
+        var rBaseUrl = runContext.render(baseUrl).as(String.class).orElse(DEFAULT_BASE_URL);
+        var rVersion = runContext.render(apiVersion).as(String.class).orElse(DEFAULT_VERSION);
+        var rOrgId = runContext.render(orgId).as(String.class)
             .filter(value -> !value.isBlank())
             .orElseThrow(() -> new IllegalArgumentException("orgId is required and must not be blank."));
-        var renderedSeverities = severities == null ? List.<Severity>of()
+        var rSeverities = severities == null ? List.<Severity>of()
             : runContext.render(severities).asList(Severity.class);
         var mode = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.FETCH);
 
         return switch (mode) {
             case FETCH_ONE -> {
                 var issues = SnykConnection.fetchIssues(
-                    runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
-                    renderedSeverities, false, true
+                    runContext, options, rToken, rBaseUrl, rVersion, rOrgId,
+                    rSeverities, false, true
                 );
                 yield FetchOutput.builder()
                     .row(issues.isEmpty() ? null : issues.getFirst())
@@ -114,36 +120,36 @@ public class ListIssues extends SnykConnection implements RunnableTask<FetchOutp
             }
             case FETCH -> {
                 var issues = SnykConnection.fetchIssues(
-                    runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
-                    renderedSeverities, true, false
+                    runContext, options, rToken, rBaseUrl, rVersion, rOrgId,
+                    rSeverities, true, false
                 );
                 yield FetchOutput.builder()
                     .rows(new ArrayList<>(issues))
                     .size((long) issues.size())
                     .build();
             }
-            case STORE -> store(runContext, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId, renderedSeverities);
+            case STORE -> store(runContext, rToken, rBaseUrl, rVersion, rOrgId, rSeverities);
             case NONE -> FetchOutput.builder().size(SnykConnection.walkIssuePages(
-                runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
-                renderedSeverities, true, false, page -> {}
+                runContext, options, rToken, rBaseUrl, rVersion, rOrgId,
+                rSeverities, true, false, page -> {}
             )).build();
         };
     }
 
     private FetchOutput store(
         RunContext runContext,
-        String renderedToken,
-        String renderedBaseUrl,
-        String renderedVersion,
-        String renderedOrgId,
-        List<Severity> renderedSeverities
+        String rToken,
+        String rBaseUrl,
+        String rVersion,
+        String rOrgId,
+        List<Severity> rSeverities
     ) throws Exception {
         var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
         long count;
         try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
             count = SnykConnection.walkIssuePages(
-                runContext, options, renderedToken, renderedBaseUrl, renderedVersion, renderedOrgId,
-                renderedSeverities, true, false, page -> FileSerde.writeAll(output, Flux.fromIterable(page)).block()
+                runContext, options, rToken, rBaseUrl, rVersion, rOrgId,
+                rSeverities, true, false, page -> FileSerde.writeAll(output, Flux.fromIterable(page)).block()
             );
         }
         var uri = runContext.storage().putFile(tempFile);
