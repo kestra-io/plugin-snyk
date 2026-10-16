@@ -38,9 +38,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.stream.Collectors;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @SuperBuilder
 @ToString
@@ -117,8 +117,6 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
     @Schema(
         title = "Snyk organization ID",
         description = """
-        
-        """"
             Snyk organization whose issues the trigger monitors.
             """
     )
@@ -129,8 +127,6 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
     @Schema(
         title = "Optional severity filter",
         description = """
-        
-        """"
             Severities to monitor. If omitted, issues of all severity levels are monitored.
             """
     )

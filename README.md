@@ -36,7 +36,7 @@ Use `outputs.list_issues.uri` to access the stored Ion file. Set `fetchType: FET
 
 ## Documentation
 
-The trigger emits one issue per polling evaluation. A backlog is drained at one issue per interval (40 issues can take up to 10 hours at the default PT15M). Each scan queues at most 100 new issues; the remaining new IDs stay out of the known-ID snapshot so later scans can pick them up after the queue drains. Known IDs are stored in shards of at most 5,000 IDs and 900 KiB per value. State metadata expires after four polling intervals and shards after five intervals, cleaning up values left behind after configuration changes. Use `ListIssues` for large exports.
+The trigger emits one issue per polling evaluation. A backlog is drained at one issue per interval (40 issues can take up to 10 hours at the default PT15M). Each scan queues at most 100 new issues; the remaining new IDs stay out of the known-ID snapshot so later scans can pick them up after the queue drains. Known IDs are stored in shards of at most 5,000 IDs. State metadata has a one-year inactivity TTL, independent of the polling interval; shard generations are reused on queue-drain polls and old generations are deleted when a replacement snapshot is committed. If the trigger remains inactive for longer than one year, its next successful poll establishes a new baseline. Use `ListIssues` for large exports.
 
 See [plugin documentation](src/main/resources/doc/io.kestra.plugin.snyk.md) for connection properties, fetch modes, trigger behavior, limits, and runnable examples.
 

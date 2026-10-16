@@ -239,7 +239,7 @@ public abstract class SnykConnection extends Task {
         }
         var candidate = current.resolve(value);
         if (candidate.getUserInfo() != null || candidate.getFragment() != null
-            || !sameOrigin(base, candidate) || !candidate.getRawPath().equals(endpointPath)) {
+            || !sameOrigin(base, candidate) || !Objects.equals(candidate.getRawPath(), endpointPath)) {
             throw new IllegalStateException("Snyk API returned an unsafe pagination link outside the configured issues endpoint.");
         }
         return candidate;
