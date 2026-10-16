@@ -420,6 +420,8 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         }
     }
 
+    private record State(List<String> knownIds, List<Map<String, Object>> pending, boolean initialized) {}
+
     @Builder
     @Getter
     @Schema(title = "Snyk issue trigger output", description = "Issue details for the Snyk issue that caused this execution.")
