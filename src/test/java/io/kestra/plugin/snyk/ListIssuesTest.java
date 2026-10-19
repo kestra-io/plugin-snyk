@@ -54,6 +54,35 @@ class ListIssuesTest {
     }
 
     @Test
+    void rootRelativePaginationLinkKeepsConfiguredRestBasePath() throws Exception {
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("relative-pagination")
+            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .willReturn(okJson("""
+                {
+                  "data": [{"id":"relative-page-1","type":"issue"}],
+                  "links": {"next":{"href":"/orgs/org-id/issues?version=2024-10-15&starting_after=cursor-relative"}}
+                }
+                """))
+            .willSetStateTo("relative-page-2"));
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .withQueryParam("starting_after", equalTo("cursor-relative"))
+            .inScenario("relative-pagination")
+            .whenScenarioStateIs("relative-page-2")
+            .willReturn(okJson("""
+                {"data":[{"id":"relative-page-2","type":"issue"}],"links":{}}
+                """)));
+
+        var output = task(FetchType.FETCH, false).run(runContextFactory.of());
+
+        assertEquals(2L, output.getSize());
+        assertEquals(2, output.getRows().size());
+        verify(2, getRequestedFor(urlPathEqualTo(PATH)));
+        verify(1, getRequestedFor(urlPathEqualTo(PATH)).withQueryParam("starting_after", equalTo("cursor-relative")));
+    }
+
+    @Test
     void fetchOneStopsAtFirstIssue() throws Exception {
         stubFor(get(urlPathEqualTo(PATH))
             .willReturn(okJson("""
