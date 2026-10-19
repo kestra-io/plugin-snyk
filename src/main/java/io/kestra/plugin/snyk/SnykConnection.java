@@ -126,7 +126,8 @@ public abstract class SnykConnection extends Task {
         requireNonBlank(rVersion, "version");
         var base = validateBaseUrl(rBaseUrl);
         var orgPath = "orgs/" + encodePathSegment(rOrgId) + "/issues";
-        var endpointPath = base.getRawPath().replaceAll("/+$", "") + "/" + orgPath;
+        var basePath = base.getRawPath() == null ? "" : base.getRawPath().replaceAll("/+$", "");
+        var endpointPath = basePath + "/" + orgPath;
         var firstUrl = new StringBuilder(base.toString().replaceAll("/+$", "")).append("/").append(orgPath)
             .append("?version=").append(encode(rVersion))
             .append("&limit=").append(ISSUES_PAGE_LIMIT);
@@ -251,7 +252,7 @@ public abstract class SnykConnection extends Task {
             return current.resolve(value);
         }
 
-        var basePath = base.getRawPath().replaceAll("/+$", "");
+        var basePath = base.getRawPath() == null ? "" : base.getRawPath().replaceAll("/+$", "");
         if (linkPath.equals(basePath) || linkPath.startsWith(basePath + "/")) {
             return current.resolve(value);
         }
