@@ -299,11 +299,11 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
                 shard = runContext.namespaceKv(namespace).getValue(shardKey);
             } catch (ResourceExpiredException e) {
                 runContext.logger().warn("Snyk issue trigger state shard {} expired; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.", shardKey);
-                return null;
+                return new State(rConfigurationKey, generation, shardCount, List.of(), List.of(), false);
             }
             if (shard.isEmpty() || shard.get().value() == null) {
                 runContext.logger().warn("Snyk issue trigger state shard {} is missing; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.", shardKey);
-                return null;
+                return new State(rConfigurationKey, generation, shardCount, List.of(), List.of(), false);
             }
             var shardRaw = shard.get().value();
             var shardIds = shardRaw instanceof String json
@@ -330,6 +330,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         var rKnownIds = List.copyOf(knownIds);
         var rPending = List.copyOf(pending);
         var sameIds = previous != null
+            && previous.initialized()
             && rConfigurationKey.equals(previous.configurationKey())
             && new LinkedHashSet<>(previous.knownIds()).equals(new LinkedHashSet<>(rKnownIds));
         var generation = sameIds ? previous.generation() : UUID.randomUUID().toString().replace("-", "");
