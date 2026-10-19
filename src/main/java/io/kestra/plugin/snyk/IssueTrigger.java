@@ -88,6 +88,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         """
     )
     @Builder.Default
+    @PluginProperty(group = "execution")
     private final Duration interval = Duration.ofMinutes(15);
 
     @Schema(title = "Snyk API token", description = """
@@ -145,8 +146,10 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
             return evaluateInternal(conditionContext, context);
         } catch (IllegalVariableEvaluationException e) {
             throw e;
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
-            throw new IllegalStateException("Failed to poll Snyk issues or persist trigger state.", e);
+            throw new IllegalStateException("Failed to poll Snyk issues or persist trigger state: " + e.getMessage(), e);
         }
     }
 
@@ -165,13 +168,13 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
 
         var key = stateKey(context);
         var rConfigurationKey = configurationKey(rOrgId, rBaseUrl, rVersion, rSeverities);
-        var previous = loadState(runContext, context.getNamespace(), key, rConfigurationKey);
+        var storedState = loadState(runContext, context.getNamespace(), key, rConfigurationKey);
+        var previous = storedState != null && rConfigurationKey.equals(storedState.configurationKey()) ? storedState : null;
         if (previous != null && !previous.pending().isEmpty()) {
             var nextIssue = previous.pending().getFirst();
             var remaining = new ArrayList<Map<String, Object>>(previous.pending().subList(1, previous.pending().size()));
             var generated = execution(conditionContext, context, nextIssue);
-            saveState(runContext, context.getNamespace(), key, rConfigurationKey,
-                new State(rConfigurationKey, null, 0, previous.knownIds(), remaining, true), previous);
+            saveState(runContext, context.getNamespace(), key, rConfigurationKey, previous.knownIds(), remaining, previous);
             return Optional.of(generated);
         }
 
@@ -196,8 +199,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         );
 
         if (previous == null || !previous.initialized()) {
-            saveState(runContext, context.getNamespace(), key, rConfigurationKey,
-                new State(rConfigurationKey, null, 0, List.copyOf(currentIds), List.of(), true), null);
+            saveState(runContext, context.getNamespace(), key, rConfigurationKey, List.copyOf(currentIds), List.of(), storedState);
             return Optional.empty();
         }
 
@@ -210,16 +212,14 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
             .toList();
 
         if (newIssues.isEmpty()) {
-            saveState(runContext, context.getNamespace(), key, rConfigurationKey,
-                new State(rConfigurationKey, null, 0, idsToPersist, List.of(), true), previous);
+            saveState(runContext, context.getNamespace(), key, rConfigurationKey, idsToPersist, List.of(), previous);
             return Optional.empty();
         }
 
         var first = newIssues.getFirst();
         var remaining = new ArrayList<>(newIssues.subList(1, newIssues.size()));
         var generated = execution(conditionContext, context, first);
-        saveState(runContext, context.getNamespace(), key, rConfigurationKey,
-            new State(rConfigurationKey, null, 0, idsToPersist, remaining, true), previous);
+        saveState(runContext, context.getNamespace(), key, rConfigurationKey, idsToPersist, remaining, previous);
         return Optional.of(generated);
     }
 
@@ -261,7 +261,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         try {
             stored = runContext.namespaceKv(namespace).getValue(key);
         } catch (ResourceExpiredException e) {
-            runContext.logger().warn("Snyk issue trigger state expired; it will establish a new baseline on this poll.");
+            runContext.logger().warn("Snyk issue trigger state expired; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.");
             return null;
         }
         if (stored.isEmpty() || stored.get().value() == null) {
@@ -272,17 +272,22 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         var values = raw instanceof String json
             ? MAPPER.readValue(json, new TypeReference<Map<String, Object>>() {})
             : MAPPER.convertValue(raw, new TypeReference<Map<String, Object>>() {});
-        if (!rConfigurationKey.equals(values.get("configurationKey"))) {
-            return null;
-        }
+        var storedConfigurationKey = values.get("configurationKey");
         if (!(values.get("generation") instanceof String generation)) {
-            runContext.logger().warn("Snyk issue trigger state has no shard generation; it will establish a new baseline.");
+            runContext.logger().warn("Snyk issue trigger state has no shard generation; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.");
             return null;
         }
 
         var shardCount = MAPPER.convertValue(values.getOrDefault("knownShardCount", 0), Integer.class);
         if (shardCount == null || shardCount < 0) {
-            runContext.logger().warn("Snyk issue trigger state has an invalid shard count; it will establish a new baseline.");
+            runContext.logger().warn("Snyk issue trigger state has an invalid shard count; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.");
+            return null;
+        }
+        if (!rConfigurationKey.equals(storedConfigurationKey)) {
+            if (storedConfigurationKey instanceof String previousConfigurationKey) {
+                return new State(previousConfigurationKey, generation, shardCount, List.of(), List.of(),
+                    Boolean.TRUE.equals(values.get("initialized")));
+            }
             return null;
         }
 
@@ -293,11 +298,11 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
             try {
                 shard = runContext.namespaceKv(namespace).getValue(shardKey);
             } catch (ResourceExpiredException e) {
-                runContext.logger().warn("Snyk issue trigger state shard {} expired; it will establish a new baseline.", shardKey);
+                runContext.logger().warn("Snyk issue trigger state shard {} expired; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.", shardKey);
                 return null;
             }
             if (shard.isEmpty() || shard.get().value() == null) {
-                runContext.logger().warn("Snyk issue trigger state shard {} is missing; it will establish a new baseline.", shardKey);
+                runContext.logger().warn("Snyk issue trigger state shard {} is missing; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.", shardKey);
                 return null;
             }
             var shardRaw = shard.get().value();
@@ -313,40 +318,45 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
             pending == null ? List.of() : List.copyOf(pending), Boolean.TRUE.equals(values.get("initialized")));
     }
 
-    private void saveState(RunContext runContext, String namespace, String key, String rConfigurationKey, State state, State previous) throws Exception {
-        var knownIds = List.copyOf(state.knownIds());
-        var pending = List.copyOf(state.pending());
+    private void saveState(
+        RunContext runContext,
+        String namespace,
+        String key,
+        String rConfigurationKey,
+        List<String> knownIds,
+        List<Map<String, Object>> pending,
+        State previous
+    ) throws Exception {
+        var rKnownIds = List.copyOf(knownIds);
+        var rPending = List.copyOf(pending);
         var sameIds = previous != null
             && rConfigurationKey.equals(previous.configurationKey())
-            && new LinkedHashSet<>(previous.knownIds()).equals(new LinkedHashSet<>(knownIds));
+            && new LinkedHashSet<>(previous.knownIds()).equals(new LinkedHashSet<>(rKnownIds));
         var generation = sameIds ? previous.generation() : UUID.randomUUID().toString().replace("-", "");
-        var shards = sameIds ? List.<List<String>>of() : chunkKnownIds(knownIds);
+        var shards = sameIds ? List.<List<String>>of() : chunkKnownIds(rKnownIds);
         var shardCount = sameIds ? previous.knownShardCount() : shards.size();
         var metadata = Map.of(
             "configurationKey", rConfigurationKey,
             "generation", generation,
             "knownShardCount", shardCount,
-            "pending", pending,
-            "initialized", state.initialized()
+            "pending", rPending,
+            "initialized", true
         );
 
         var kv = runContext.namespaceKv(namespace);
         if (!sameIds) {
             for (var index = 0; index < shards.size(); index++) {
                 kv.put(stateShardKey(key, generation, index),
-                    new KVValueAndMetadata(null, MAPPER.writeValueAsString(shards.get(index))), true);
+                    new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state shard", STATE_TTL),
+                        MAPPER.writeValueAsString(shards.get(index))), true);
             }
         }
         kv.put(key, new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", STATE_TTL),
             MAPPER.writeValueAsString(metadata)), true);
 
-        if (!sameIds) {
-            var shardPrefix = key + "-g-";
-            var retainedPrefix = shardPrefix + generation + "-ids-";
-            for (var entry : kv.list()) {
-                if (entry.key().startsWith(shardPrefix) && !entry.key().startsWith(retainedPrefix)) {
-                    kv.delete(entry.key());
-                }
+        if (!sameIds && previous != null && previous.generation() != null) {
+            for (var index = 0; index < previous.knownShardCount(); index++) {
+                kv.delete(stateShardKey(key, previous.generation(), index));
             }
         }
     }
