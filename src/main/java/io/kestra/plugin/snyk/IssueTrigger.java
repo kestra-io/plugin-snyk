@@ -32,6 +32,7 @@ import lombok.experimental.SuperBuilder;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -279,6 +280,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         }
 
         var shardCount = MAPPER.convertValue(values.getOrDefault("knownShardCount", 0), Integer.class);
+        var shardsWrittenAt = values.get("shardsWrittenAt") instanceof Number timestamp ? timestamp.longValue() : 0L;
         if (shardCount == null || shardCount < 0) {
             runContext.logger().warn("Snyk issue trigger state has an invalid shard count; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.");
             return null;
@@ -286,7 +288,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         if (!rConfigurationKey.equals(storedConfigurationKey)) {
             if (storedConfigurationKey instanceof String previousConfigurationKey) {
                 return new State(previousConfigurationKey, generation, shardCount, List.of(), List.of(),
-                    Boolean.TRUE.equals(values.get("initialized")));
+                    Boolean.TRUE.equals(values.get("initialized")), shardsWrittenAt);
             }
             return null;
         }
@@ -299,11 +301,11 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
                 shard = runContext.namespaceKv(namespace).getValue(shardKey);
             } catch (ResourceExpiredException e) {
                 runContext.logger().warn("Snyk issue trigger state shard {} expired; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.", shardKey);
-                return new State(rConfigurationKey, generation, shardCount, List.of(), List.of(), false);
+                return new State(rConfigurationKey, generation, shardCount, List.of(), List.of(), false, shardsWrittenAt);
             }
             if (shard.isEmpty() || shard.get().value() == null) {
                 runContext.logger().warn("Snyk issue trigger state shard {} is missing; pending issues and issues created while state was unavailable may be skipped. Establishing a new baseline.", shardKey);
-                return new State(rConfigurationKey, generation, shardCount, List.of(), List.of(), false);
+                return new State(rConfigurationKey, generation, shardCount, List.of(), List.of(), false, shardsWrittenAt);
             }
             var shardRaw = shard.get().value();
             var shardIds = shardRaw instanceof String json
@@ -315,7 +317,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         var pending = MAPPER.convertValue(values.getOrDefault("pending", List.of()),
             new TypeReference<List<Map<String, Object>>>() {});
         return new State(rConfigurationKey, generation, shardCount, List.copyOf(ids),
-            pending == null ? List.of() : List.copyOf(pending), Boolean.TRUE.equals(values.get("initialized")));
+            pending == null ? List.of() : List.copyOf(pending), Boolean.TRUE.equals(values.get("initialized")), shardsWrittenAt);
     }
 
     private void saveState(
@@ -333,23 +335,46 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
             && previous.initialized()
             && rConfigurationKey.equals(previous.configurationKey())
             && new LinkedHashSet<>(previous.knownIds()).equals(new LinkedHashSet<>(rKnownIds));
+        var now = Instant.now();
+        var shouldRefreshShards = !sameIds
+            || previous.shardsWrittenAt() == 0L
+            || now.toEpochMilli() - previous.shardsWrittenAt() >= STATE_TTL.toMillis() / 2;
         var generation = sameIds ? previous.generation() : UUID.randomUUID().toString().replace("-", "");
-        var shards = sameIds ? List.<List<String>>of() : chunkKnownIds(rKnownIds);
+        var shards = shouldRefreshShards ? chunkKnownIds(rKnownIds) : List.<List<String>>of();
         var shardCount = sameIds ? previous.knownShardCount() : shards.size();
+        var shardsWrittenAt = shouldRefreshShards ? now.toEpochMilli() : previous.shardsWrittenAt();
         var metadata = Map.of(
             "configurationKey", rConfigurationKey,
             "generation", generation,
             "knownShardCount", shardCount,
+            "shardsWrittenAt", shardsWrittenAt,
             "pending", rPending,
             "initialized", true
         );
 
         var kv = runContext.namespaceKv(namespace);
-        if (!sameIds) {
-            for (var index = 0; index < shards.size(); index++) {
-                kv.put(stateShardKey(key, generation, index),
-                    new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state shard", STATE_TTL),
-                        MAPPER.writeValueAsString(shards.get(index))), true);
+        if (!shards.isEmpty()) {
+            var lastAttemptedShard = -1;
+            try {
+                for (var index = 0; index < shards.size(); index++) {
+                    lastAttemptedShard = index;
+                    kv.put(stateShardKey(key, generation, index),
+                        new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state shard", STATE_TTL),
+                            MAPPER.writeValueAsString(shards.get(index))), true);
+                }
+            } catch (Exception writeFailure) {
+                if (!sameIds) {
+                    for (var index = 0; index <= lastAttemptedShard; index++) {
+                        var stagedShardKey = stateShardKey(key, generation, index);
+                        try {
+                            kv.delete(stagedShardKey);
+                        } catch (Exception cleanupFailure) {
+                            runContext.logger().warn("Failed to clean up staged Snyk state shard {} after a write failure: {}",
+                                stagedShardKey, cleanupFailure.getMessage());
+                        }
+                    }
+                }
+                throw writeFailure;
             }
         }
         kv.put(key, new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", STATE_TTL),
@@ -357,7 +382,16 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
 
         if (!sameIds && previous != null && previous.generation() != null) {
             for (var index = 0; index < previous.knownShardCount(); index++) {
-                kv.delete(stateShardKey(key, previous.generation(), index));
+                var staleShardKey = stateShardKey(key, previous.generation(), index);
+                try {
+                    if (!kv.delete(staleShardKey)) {
+                        runContext.logger().warn("Snyk issue trigger state was committed, but stale shard {} was not deleted.",
+                            staleShardKey);
+                    }
+                } catch (Exception cleanupFailure) {
+                    runContext.logger().warn("Snyk issue trigger state was committed, but stale shard cleanup failed for {}: {}",
+                        staleShardKey, cleanupFailure.getMessage());
+                }
             }
         }
     }
@@ -374,7 +408,7 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         return key + "-g-" + generation + "-ids-" + index;
     }
 
-    private record State(String configurationKey, String generation, int knownShardCount, List<String> knownIds, List<Map<String, Object>> pending, boolean initialized) {}
+    private record State(String configurationKey, String generation, int knownShardCount, List<String> knownIds, List<Map<String, Object>> pending, boolean initialized, long shardsWrittenAt) {}
 
     @Builder
     @Getter
