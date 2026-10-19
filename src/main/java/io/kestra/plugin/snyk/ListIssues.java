@@ -57,7 +57,7 @@ import java.util.Map;
             title = "Fetch issues in the EU region",
             full = true,
             code = """
-                id: snyk_issue_count
+                id: snyk_list_issues_eu
                 namespace: company.security
 
                 tasks:
