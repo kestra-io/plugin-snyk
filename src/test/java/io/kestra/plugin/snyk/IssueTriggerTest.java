@@ -21,8 +21,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
+import Collectors;
+import IntStream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -44,7 +44,7 @@ class IssueTriggerTest {
     void establishesBaselineThenEmitsEachNewIssueOnce() throws Exception {
         stubFor(get(urlPathEqualTo(PATH))
             .inScenario("snyk-issue-snapshots")
-            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .whenScenarioStateIs(Scenario.STARTED)
             .willReturn(okJson("""
                 {"data":[{"id":"existing","type":"issue"}],"links":{}}
                 """))
@@ -247,12 +247,12 @@ class IssueTriggerTest {
             .date(ZonedDateTime.now(ZoneOffset.UTC))
             .build();
 
-        var issues = java.util.stream.IntStream.range(0, 101)
+        var issues = IntStream.range(0, 101)
             .mapToObj(i -> "{\"id\":\"new-" + i + "\",\"type\":\"issue\"}")
-            .collect(java.util.stream.Collectors.joining(","));
+            .collect(Collectors.joining(","));
         stubFor(get(urlPathEqualTo(PATH))
             .inScenario("snyk-large-backlog")
-            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .whenScenarioStateIs(Scenario.STARTED)
             .willReturn(okJson("""
                 {"data":[{"id":"existing","type":"issue"}],"links":{}}
                 """))
@@ -288,7 +288,7 @@ class IssueTriggerTest {
 
     @Test
     void knownIssueIdsAreSplitIntoBoundedKvShards() throws Exception {
-        var ids = java.util.stream.IntStream.range(0, IssueTrigger.MAX_IDS_PER_STATE_SHARD + 1)
+        var ids = IntStream.range(0, IssueTrigger.MAX_IDS_PER_STATE_SHARD + 1)
             .mapToObj(i -> "issue-" + i)
             .toList();
         var shards = IssueTrigger.chunkKnownIds(ids);
@@ -309,7 +309,7 @@ class IssueTriggerTest {
 
         stubFor(get(urlPathEqualTo(PATH))
             .inScenario("missing-shard-recovery")
-            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .whenScenarioStateIs(Scenario.STARTED)
             .willReturn(okJson("""
                 {"data":[{"id":"existing","type":"issue"}],"links":{}}
                 """))
@@ -350,7 +350,7 @@ class IssueTriggerTest {
 
         stubFor(get(urlPathEqualTo(PATH))
             .inScenario("drain-shard-reuse")
-            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .whenScenarioStateIs(Scenario.STARTED)
             .willReturn(okJson("""
                 {"data":[{"id":"existing","type":"issue"}],"links":{}}
                 """))
