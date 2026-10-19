@@ -35,7 +35,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-/** Shared Snyk connection properties and REST API handling. */
 @SuperBuilder
 @ToString
 @EqualsAndHashCode
@@ -144,7 +143,7 @@ public abstract class SnykConnection extends Task {
         var configuration = options == null ? HttpConfiguration.builder().build() : options;
         var total = 0L;
 
-        try (HttpClient client = new HttpClient(runContext, configuration)) {
+        try (var client = new HttpClient(runContext, configuration)) {
             var pages = 0;
             while (current != null) {
                 if (++pages > MAX_PAGES) {
@@ -237,12 +236,36 @@ public abstract class SnykConnection extends Task {
         if (value.isBlank()) {
             return null;
         }
-        var candidate = current.resolve(value);
+        var candidate = resolveNextPage(value, current, base);
         if (candidate.getUserInfo() != null || candidate.getFragment() != null
             || !sameOrigin(base, candidate) || !Objects.equals(candidate.getRawPath(), endpointPath)) {
             throw new IllegalStateException("Snyk API returned an unsafe pagination link outside the configured issues endpoint.");
         }
         return candidate;
+    }
+
+    private static URI resolveNextPage(String value, URI current, URI base) {
+        var link = URI.create(value);
+        var linkPath = link.getRawPath();
+        if (link.isAbsolute() || link.getRawAuthority() != null || linkPath == null || linkPath.isEmpty()) {
+            return current.resolve(value);
+        }
+
+        var basePath = base.getRawPath().replaceAll("/+$", "");
+        if (linkPath.equals(basePath) || linkPath.startsWith(basePath + "/")) {
+            return current.resolve(value);
+        }
+
+        var rebasedPath = linkPath.startsWith("/") ? basePath + linkPath : basePath + "/" + linkPath;
+        var rebased = new StringBuilder()
+            .append(base.getScheme()).append("://").append(base.getRawAuthority()).append(rebasedPath);
+        if (link.getRawQuery() != null) {
+            rebased.append("?").append(link.getRawQuery());
+        }
+        if (link.getRawFragment() != null) {
+            rebased.append("#").append(link.getRawFragment());
+        }
+        return URI.create(rebased.toString());
     }
 
     static URI validateBaseUrl(String rBaseUrl) {
