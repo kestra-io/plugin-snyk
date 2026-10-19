@@ -1,6 +1,7 @@
 package io.kestra.plugin.snyk;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockTest;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.common.FetchType;
@@ -57,7 +58,7 @@ class ListIssuesTest {
     void rootRelativePaginationLinkKeepsConfiguredRestBasePath() throws Exception {
         stubFor(get(urlPathEqualTo(PATH))
             .inScenario("relative-pagination")
-            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .whenScenarioStateIs(Scenario.STARTED)
             .willReturn(okJson("""
                 {
                   "data": [{"id":"relative-page-1","type":"issue"}],
@@ -273,7 +274,7 @@ class ListIssuesTest {
             .apiVersion(Property.ofValue("2024-10-15"))
             .orgId(Property.ofValue("org-id"))
             .severities(highAndCritical
-                ? Property.ofValue(java.util.List.of(SnykConnection.Severity.CRITICAL, SnykConnection.Severity.HIGH))
+                ? Property.ofValue(List.of(SnykConnection.Severity.CRITICAL, SnykConnection.Severity.HIGH))
                 : Property.ofValue(List.of()))
             .fetchType(Property.ofValue(fetchType))
             .build();
