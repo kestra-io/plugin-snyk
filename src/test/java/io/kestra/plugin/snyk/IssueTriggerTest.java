@@ -10,11 +10,16 @@ import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.runners.RunContextInitializer;
+import io.kestra.core.storages.kv.KVMetadata;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.mockito.Mockito;
 
+import java.io.IOException;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -85,7 +90,7 @@ class IssueTriggerTest {
             .apiVersion(Property.ofValue("2024-10-15"))
             .orgId(Property.ofValue("org-id"))
             .severities(Property.ofValue(List.of()))
-            .interval(java.time.Duration.ofMinutes(15))
+            .interval(Duration.ofMinutes(15))
             .build();
         var flow = Flow.builder()
             .id(flowId)
@@ -273,9 +278,8 @@ class IssueTriggerTest {
         assertTrue(first.isPresent());
         assertEquals("new-0", ((Map<?, ?>) first.get().getTrigger().getVariables()).get("issueId"));
 
-        // The first 100 issues are emitted individually. The 101st ID is not marked known,
-        // so a later scan discovers it after the pending queue drains.
-        for (int expected = 1; expected < 100; expected++) {
+        // Overflow IDs stay unknown until the pending queue drains, allowing later scans to rediscover them.
+        for (var expected = 1; expected < 100; expected++) {
             var next = trigger.evaluate(conditionContext, triggerContext);
             assertTrue(next.isPresent(), "queued issue new-" + expected + " should be emitted");
             assertEquals("new-" + expected, ((Map<?, ?>) next.get().getTrigger().getVariables()).get("issueId"));
@@ -337,6 +341,139 @@ class IssueTriggerTest {
         assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
             "the recovered baseline should suppress historical duplicates");
         verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void staleShardCleanupFailureDoesNotDropNewIssueExecution() throws Exception {
+        var flowId = "snyk-cleanup-failure-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-cleanup-failure-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("stale-shard-cleanup-failure")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("new-issue"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("stale-shard-cleanup-failure")
+            .whenScenarioStateIs("new-issue")
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-issue","type":"issue"}],"links":{}}
+                """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var initializedContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var kv = Mockito.spy(initializedContext.namespaceKv(flow.getNamespace()));
+        var runContext = Mockito.spy(initializedContext);
+        Mockito.doReturn(kv).when(runContext).namespaceKv(flow.getNamespace());
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        var staleShardKey = kv.list().stream()
+            .map(entry -> entry.key())
+            .filter(key -> key.startsWith(stateKey + "-g-"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("baseline should create a known-ID shard"));
+        Mockito.doThrow(new IOException("simulated stale shard cleanup failure")).when(kv).delete(staleShardKey);
+
+        var emitted = trigger.evaluate(conditionContext, triggerContext);
+
+        assertTrue(emitted.isPresent(), "a cleanup failure after the pointer commit must not drop the new issue execution");
+        assertEquals("new-issue", ((Map<?, ?>) emitted.get().getTrigger().getVariables()).get("issueId"));
+        assertTrue(kv.getValue(stateKey).isPresent(), "the state pointer must remain committed");
+        Mockito.verify(kv).delete(staleShardKey);
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void stagedShardWritesAreCleanedUpWhenAGenerationWriteFails() throws Exception {
+        var flowId = "snyk-partial-shard-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-partial-shard-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+        var issues = IntStream.range(0, IssueTrigger.MAX_IDS_PER_STATE_SHARD + 1)
+            .mapToObj(index -> "{\"id\":\"baseline-" + index + "\",\"type\":\"issue\"}")
+            .collect(Collectors.joining(","));
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("{\"data\":[" + issues + "],\"links\":{}}")));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var initializedContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var kv = Mockito.spy(initializedContext.namespaceKv(flow.getNamespace()));
+        var runContext = Mockito.spy(initializedContext);
+        Mockito.doReturn(kv).when(runContext).namespaceKv(flow.getNamespace());
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        Mockito.doAnswer(invocation -> {
+            var candidateKey = (String) invocation.getArgument(0);
+            if (candidateKey.startsWith(stateKey + "-g-") && candidateKey.endsWith("-ids-1")) {
+                throw new IOException("simulated second shard write failure");
+            }
+            return invocation.callRealMethod();
+        }).when(kv).put(Mockito.anyString(), Mockito.any(KVValueAndMetadata.class), Mockito.anyBoolean());
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+
+        assertTrue(error.getMessage().contains("simulated second shard write failure"));
+        assertTrue(kv.getValue(stateKey).isEmpty(), "a failed baseline write must not publish a pointer");
+        assertTrue(kv.list().stream().noneMatch(entry -> entry.key().startsWith(stateKey + "-g-")),
+            "all staged shards should be removed after a partial generation write");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void reusedShardsRefreshTheirTtlAfterHalfTheStateLifetime() throws Exception {
+        var flowId = "snyk-shard-ttl-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-shard-ttl-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
+            {"data":[{"id":"existing","type":"issue"}],"links":{}}
+            """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        var kv = runContext.namespaceKv(flow.getNamespace());
+        var shardKey = kv.list().stream()
+            .map(entry -> entry.key())
+            .filter(key -> key.startsWith(stateKey + "-g-"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("baseline should create a known-ID shard"));
+        var beforeExpiration = kv.get(shardKey).orElseThrow().expirationDate();
+        var rawPointer = kv.getValue(stateKey).orElseThrow().value();
+        assertTrue(rawPointer instanceof String, "pointer should be serialized JSON");
+        var stalePointer = ((String) rawPointer).replaceFirst(
+            "\"shardsWrittenAt\"\\s*:\\s*\\d+",
+            "\"shardsWrittenAt\":" + Instant.now().minus(IssueTrigger.STATE_TTL).toEpochMilli()
+        );
+        assertNotEquals(rawPointer, stalePointer, "test must backdate the shard refresh marker");
+        kv.put(stateKey,
+            new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", IssueTrigger.STATE_TTL), stalePointer), true);
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+        var afterExpiration = kv.get(shardKey).orElseThrow().expirationDate();
+
+        assertNotNull(beforeExpiration);
+        assertNotNull(afterExpiration);
+        assertTrue(afterExpiration.isAfter(beforeExpiration), "unchanged known-ID shards should receive a renewed TTL");
+        verify(2, getRequestedFor(urlPathEqualTo(PATH)));
     }
 
     @Test
