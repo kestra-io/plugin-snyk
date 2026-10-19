@@ -353,32 +353,32 @@ public class IssueTrigger extends AbstractTrigger implements PollingTriggerInter
         );
 
         var kv = runContext.namespaceKv(namespace);
-        if (!shards.isEmpty()) {
-            var lastAttemptedShard = -1;
-            try {
+        var lastAttemptedShard = -1;
+        try {
+            if (!shards.isEmpty()) {
                 for (var index = 0; index < shards.size(); index++) {
                     lastAttemptedShard = index;
                     kv.put(stateShardKey(key, generation, index),
                         new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state shard", STATE_TTL),
                             MAPPER.writeValueAsString(shards.get(index))), true);
                 }
-            } catch (Exception writeFailure) {
-                if (!sameIds) {
-                    for (var index = 0; index <= lastAttemptedShard; index++) {
-                        var stagedShardKey = stateShardKey(key, generation, index);
-                        try {
-                            kv.delete(stagedShardKey);
-                        } catch (Exception cleanupFailure) {
-                            runContext.logger().warn("Failed to clean up staged Snyk state shard {} after a write failure: {}",
-                                stagedShardKey, cleanupFailure.getMessage());
-                        }
+            }
+            kv.put(key, new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", STATE_TTL),
+                MAPPER.writeValueAsString(metadata)), true);
+        } catch (Exception writeFailure) {
+            if (!sameIds) {
+                for (var index = 0; index <= lastAttemptedShard; index++) {
+                    var stagedShardKey = stateShardKey(key, generation, index);
+                    try {
+                        kv.delete(stagedShardKey);
+                    } catch (Exception cleanupFailure) {
+                        runContext.logger().warn("Failed to clean up staged Snyk state shard {} after a state write failure: {}",
+                            stagedShardKey, cleanupFailure.getMessage());
                     }
                 }
-                throw writeFailure;
             }
+            throw writeFailure;
         }
-        kv.put(key, new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", STATE_TTL),
-            MAPPER.writeValueAsString(metadata)), true);
 
         if (!sameIds && previous != null && previous.generation() != null) {
             for (var index = 0; index < previous.knownShardCount(); index++) {
