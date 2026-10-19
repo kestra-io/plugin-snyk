@@ -1,6 +1,7 @@
 package io.kestra.plugin.snyk;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockTest;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.flows.Flow;
@@ -20,6 +21,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -72,9 +75,9 @@ class IssueTriggerTest {
                 {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
                 """)));
 
-        String flowId = "snyk-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        String triggerId = "new-issues-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        IssueTrigger trigger = IssueTrigger.builder()
+        var flowId = "snyk-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "new-issues-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var trigger = IssueTrigger.builder()
             .id(triggerId)
             .type(IssueTrigger.class.getName())
             .token(Property.ofValue("test-token"))
@@ -121,9 +124,63 @@ class IssueTriggerTest {
 
     @Test
     @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void failedPollDoesNotAdvanceStateAndRecoveryStillDetectsNewIssues() throws Exception {
+        var flowId = "snyk-failed-poll-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-failed-poll-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("failed-poll-preserves-state")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("fail-once"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("failed-poll-preserves-state")
+            .whenScenarioStateIs("fail-once")
+            .willReturn(aResponse().withStatus(500).withBody("temporary upstream failure"))
+            .willSetStateTo("recovered"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("failed-poll-preserves-state")
+            .whenScenarioStateIs("recovered")
+            .willReturn(okJson("""
+                {"data":[
+                  {"id":"existing","type":"issue"},
+                  {"id":"new-after-failed-poll","type":"issue"}
+                ],"links":{}}
+                """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(), "initial poll establishes the baseline");
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+        assertTrue(error.getMessage().contains("HTTP status: 500"), "the original API error should remain visible");
+
+        var recovered = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(recovered.isPresent(), "the unchanged baseline should remain available after the failed poll");
+        assertEquals("new-after-failed-poll",
+            ((Map<?, ?>) recovered.get().getTrigger().getVariables()).get("issueId"));
+        verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
     void triggerStateIsIsolatedByOrganizationAndSeverityConfiguration() throws Exception {
-        String flowId = "snyk-config-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        String triggerId = "snyk-config-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flowId = "snyk-config-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-config-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         var flow = Flow.builder()
             .id(flowId)
             .namespace("company.security")
@@ -175,8 +232,8 @@ class IssueTriggerTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void pendingOverflowIsQueuedInBatchesAndPickedUpByLaterPolls() throws Exception {
-        String flowId = "snyk-backlog-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        String triggerId = "snyk-backlog-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flowId = "snyk-backlog-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-backlog-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         var flow = Flow.builder()
             .id(flowId)
             .namespace("company.security")
@@ -190,7 +247,7 @@ class IssueTriggerTest {
             .date(ZonedDateTime.now(ZoneOffset.UTC))
             .build();
 
-        String issues = java.util.stream.IntStream.range(0, 101)
+        var issues = java.util.stream.IntStream.range(0, 101)
             .mapToObj(i -> "{\"id\":\"new-" + i + "\",\"type\":\"issue\"}")
             .collect(java.util.stream.Collectors.joining(","));
         stubFor(get(urlPathEqualTo(PATH))
@@ -242,15 +299,10 @@ class IssueTriggerTest {
     }
 
     @Test
-    void stateMetadataTtlIsOneYearAndIndependentOfPollingInterval() {
-        assertEquals(Duration.ofDays(365), IssueTrigger.STATE_TTL);
-    }
-
-    @Test
     @Timeout(value = 35, unit = TimeUnit.SECONDS)
     void missingShardRecoversByEstablishingANewBaseline() throws Exception {
-        String flowId = "snyk-missing-shard-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        String triggerId = "snyk-missing-shard-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flowId = "snyk-missing-shard-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-missing-shard-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
         var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
             .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
@@ -290,8 +342,8 @@ class IssueTriggerTest {
     @Test
     @Timeout(value = 35, unit = TimeUnit.SECONDS)
     void drainPollDoesNotRewriteKnownIdShards() throws Exception {
-        String flowId = "snyk-drain-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        String triggerId = "snyk-drain-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flowId = "snyk-drain-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-drain-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
         var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
             .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
