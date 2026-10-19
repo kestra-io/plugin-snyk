@@ -240,27 +240,40 @@ class ListIssuesTest {
 
     @ParameterizedTest(name = "rejects unsafe pagination link: {0}")
     @MethodSource("unsafePaginationLinks")
-    void paginationLinkMustStayOnConfiguredIssuesEndpoint(String description, String nextHref) {
-        stubFor(get(urlPathEqualTo(PATH))
+    void paginationLinkMustStayOnConfiguredIssuesEndpoint(
+        String description,
+        String rBaseUrl,
+        String requestPath,
+        String nextHref
+    ) {
+        stubFor(get(urlPathEqualTo(requestPath))
             .willReturn(okJson("""
                 {"data":[{"id":"issue-1","type":"issue"}],"links":{"next":{"href":"%s"}}}
                 """.formatted(nextHref))));
 
         var error = assertThrows(IllegalStateException.class,
-            () -> task(FetchType.FETCH, true).run(runContextFactory.of()));
+            () -> task(FetchType.FETCH, true, rBaseUrl).run(runContextFactory.of()));
 
         assertTrue(error.getMessage().contains("unsafe pagination link"), description);
-        verify(1, getRequestedFor(urlPathEqualTo(PATH)));
+        verify(1, getRequestedFor(urlPathEqualTo(requestPath)));
     }
 
     static Stream<Arguments> unsafePaginationLinks() {
+        var restBase = BASE_URL;
+        var restPath = PATH;
+        var rootBase = "http://localhost:18089";
+        var rootPath = "/orgs/org-id/issues";
         return Stream.of(
-            Arguments.of("foreign origin", "https://attacker.example/rest/orgs/org-id/issues?version=2024-10-15"),
-            Arguments.of("scheme-relative authority", "//attacker.example/rest/orgs/org-id/issues?version=2024-10-15"),
-            Arguments.of("different path on same host", "http://localhost:18089/rest/orgs/other-org/issues?version=2024-10-15"),
-            Arguments.of("dot-segment traversal", "../orgs/other-org/issues?version=2024-10-15"),
-            Arguments.of("encoded dot-segment traversal", "/%2e%2e/orgs/org-id/issues?version=2024-10-15"),
-            Arguments.of("REST-prefix lookalike", "/restaurant/orgs/org-id/issues?version=2024-10-15")
+            Arguments.of("foreign origin", restBase, restPath, "https://attacker.example/rest/orgs/org-id/issues?version=2024-10-15"),
+            Arguments.of("scheme-relative authority", restBase, restPath, "//attacker.example/rest/orgs/org-id/issues?version=2024-10-15"),
+            Arguments.of("different path on same host", restBase, restPath, "http://localhost:18089/rest/orgs/other-org/issues?version=2024-10-15"),
+            Arguments.of("dot-segment traversal", restBase, restPath, "../orgs/other-org/issues?version=2024-10-15"),
+            Arguments.of("encoded dot-segment traversal", restBase, restPath, "/%2e%2e/orgs/org-id/issues?version=2024-10-15"),
+            Arguments.of("REST-prefix lookalike", restBase, restPath, "/restaurant/orgs/org-id/issues?version=2024-10-15"),
+            Arguments.of("different path without REST base", rootBase, rootPath, "http://localhost:18089/orgs/other-org/issues?version=2024-10-15"),
+            Arguments.of("dot-segment traversal without REST base", rootBase, rootPath, "../orgs/other-org/issues?version=2024-10-15"),
+            Arguments.of("encoded dot-segment without REST base", rootBase, rootPath, "/%2e%2e/orgs/org-id/issues?version=2024-10-15"),
+            Arguments.of("REST-prefix lookalike without REST base", rootBase, rootPath, "/restaurant/orgs/org-id/issues?version=2024-10-15")
         );
     }
 
