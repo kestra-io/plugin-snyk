@@ -432,6 +432,43 @@ class IssueTriggerTest {
 
     @Test
     @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void stagedShardsAreCleanedUpWhenStatePointerWriteFails() throws Exception {
+        var flowId = "snyk-pointer-write-failure-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-pointer-write-failure-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
+            {"data":[{"id":"baseline-issue","type":"issue"}],"links":{}}
+            """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var initializedContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var kv = Mockito.spy(initializedContext.namespaceKv(flow.getNamespace()));
+        var runContext = Mockito.spy(initializedContext);
+        Mockito.doReturn(kv).when(runContext).namespaceKv(flow.getNamespace());
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        Mockito.doAnswer(invocation -> {
+            var candidateKey = (String) invocation.getArgument(0);
+            if (candidateKey.equals(stateKey)) {
+                throw new IOException("simulated state pointer write failure");
+            }
+            return invocation.callRealMethod();
+        }).when(kv).put(Mockito.anyString(), Mockito.any(KVValueAndMetadata.class), Mockito.anyBoolean());
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+
+        assertTrue(error.getMessage().contains("simulated state pointer write failure"));
+        assertTrue(kv.getValue(stateKey).isEmpty(), "a failed pointer write must not publish trigger state");
+        assertTrue(kv.list().stream().noneMatch(entry -> entry.key().startsWith(stateKey + "-g-")),
+            "staged shards should be removed when the pointer write fails");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
     void reusedShardsRefreshTheirTtlAfterHalfTheStateLifetime() throws Exception {
         var flowId = "snyk-shard-ttl-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         var triggerId = "snyk-shard-ttl-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
