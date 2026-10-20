@@ -1,7 +1,7 @@
 @PluginSubGroup(
     title = "Snyk",
-    description = "Snyk plugin for Kestra",
-    categories = PluginSubGroup.PluginCategory.DATA
+    description = "Retrieve and monitor security issues from Snyk",
+    categories = PluginSubGroup.PluginCategory.INFRASTRUCTURE
 )
 package io.kestra.plugin.snyk;
 

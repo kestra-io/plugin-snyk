@@ -1,7 +1,7 @@
 group: io.kestra.plugin.snyk
 name: "snyk"
 title: "Snyk"
-description: "Snyk plugin for Kestra"
+description: "Retrieve and monitor security issues from Snyk"
 body: ""
 videos: []
 createdBy: "Kestra Core Team"

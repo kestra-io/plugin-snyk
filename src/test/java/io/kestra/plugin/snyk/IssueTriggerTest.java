@@ -1,0 +1,576 @@
+package io.kestra.plugin.snyk;
+
+import com.github.tomakehurst.wiremock.junit5.WireMockTest;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.models.conditions.ConditionContext;
+import io.kestra.core.models.flows.Flow;
+import io.kestra.core.models.property.Property;
+import io.kestra.core.models.triggers.TriggerContext;
+import io.kestra.core.runners.DefaultRunContext;
+import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.runners.RunContextInitializer;
+import io.kestra.core.storages.kv.KVMetadata;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
+import jakarta.inject.Inject;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.mockito.Mockito;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+@KestraTest(startWorker = false)
+@WireMockTest(httpPort = 18089)
+class IssueTriggerTest {
+    private static final String BASE_URL = "http://localhost:18089/rest";
+    private static final String PATH = "/rest/orgs/org-id/issues";
+
+    @Inject
+    RunContextFactory runContextFactory;
+
+    @Inject
+    RunContextInitializer runContextInitializer;
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void establishesBaselineThenEmitsEachNewIssueOnce() throws Exception {
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-issue-snapshots")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("new-issues"));
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-issue-snapshots")
+            .whenScenarioStateIs("new-issues")
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"}],
+                 "links":{"next":"http://localhost:18089/rest/orgs/org-id/issues?version=2024-10-15&starting_after=cursor-trigger"}}
+                """))
+            .willSetStateTo("new-issues-page2"));
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .withQueryParam("starting_after", equalTo("cursor-trigger"))
+            .inScenario("snyk-issue-snapshots")
+            .whenScenarioStateIs("new-issues-page2")
+            .willReturn(okJson("""
+                {"data":[{"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("stable"));
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-issue-snapshots")
+            .whenScenarioStateIs("stable")
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
+                """)));
+
+        var flowId = "snyk-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "new-issues-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var trigger = IssueTrigger.builder()
+            .id(triggerId)
+            .type(IssueTrigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .baseUrl(Property.ofValue(BASE_URL))
+            .apiVersion(Property.ofValue("2024-10-15"))
+            .orgId(Property.ofValue("org-id"))
+            .severities(Property.ofValue(List.of()))
+            .interval(Duration.ofMinutes(15))
+            .build();
+        var flow = Flow.builder()
+            .id(flowId)
+            .namespace("company.security")
+            .tenantId("test-tenant")
+            .build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+        var baseRunContext = (DefaultRunContext) runContextFactory.of(flow, trigger);
+        var runContext = runContextInitializer.forScheduler(baseRunContext, triggerContext, trigger);
+        var conditionContext = ConditionContext.builder()
+            .runContext(runContext)
+            .flow(flow)
+            .build();
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
+            "first poll should baseline existing issues");
+
+        var first = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(first.isPresent(), "first newly detected issue should trigger");
+        assertEquals("new-1", ((Map<?, ?>) first.get().getTrigger().getVariables()).get("issueId"));
+
+        var second = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(second.isPresent(), "queued issue should trigger on the next poll");
+        assertEquals("new-2", ((Map<?, ?>) second.get().getTrigger().getVariables()).get("issueId"));
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
+            "unchanged snapshot should not trigger duplicates");
+        verify(4, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void failedPollDoesNotAdvanceStateAndRecoveryStillDetectsNewIssues() throws Exception {
+        var flowId = "snyk-failed-poll-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-failed-poll-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("failed-poll-preserves-state")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("fail-once"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("failed-poll-preserves-state")
+            .whenScenarioStateIs("fail-once")
+            .willReturn(aResponse().withStatus(500).withBody("temporary upstream failure"))
+            .willSetStateTo("recovered"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("failed-poll-preserves-state")
+            .whenScenarioStateIs("recovered")
+            .willReturn(okJson("""
+                {"data":[
+                  {"id":"existing","type":"issue"},
+                  {"id":"new-after-failed-poll","type":"issue"}
+                ],"links":{}}
+                """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(), "initial poll establishes the baseline");
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+        assertTrue(error.getMessage().contains("HTTP status: 500"), "the original API error should remain visible");
+
+        var recovered = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(recovered.isPresent(), "the unchanged baseline should remain available after the failed poll");
+        assertEquals("new-after-failed-poll",
+            ((Map<?, ?>) recovered.get().getTrigger().getVariables()).get("issueId"));
+        verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void triggerStateIsIsolatedByOrganizationAndSeverityConfiguration() throws Exception {
+        var flowId = "snyk-config-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-config-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder()
+            .id(flowId)
+            .namespace("company.security")
+            .tenantId("test-tenant")
+            .build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
+            {"data":[{"id":"baseline","type":"issue"}],"links":{}}
+            """)));
+        var baselineTrigger = configuredTrigger(triggerId, "org-id", List.of());
+        var baselineRunContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, baselineTrigger), triggerContext, baselineTrigger
+        );
+        var baselineCondition = ConditionContext.builder().runContext(baselineRunContext).flow(flow).build();
+        assertTrue(baselineTrigger.evaluate(baselineCondition, triggerContext).isEmpty());
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .withQueryParam("effective_severity_level", equalTo("critical"))
+            .willReturn(okJson("""
+                {"data":[{"id":"historical-critical","type":"issue"}],"links":{}}
+                """)));
+        var criticalTrigger = configuredTrigger(triggerId, "org-id", List.of(SnykConnection.Severity.CRITICAL));
+        var criticalRunContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, criticalTrigger), triggerContext, criticalTrigger
+        );
+        var criticalCondition = ConditionContext.builder().runContext(criticalRunContext).flow(flow).build();
+        assertTrue(criticalTrigger.evaluate(criticalCondition, triggerContext).isEmpty(),
+            "changing severity filter must establish a new baseline rather than emit historical matching issues");
+
+        stubFor(get(urlPathEqualTo("/rest/orgs/other-org/issues")).willReturn(okJson("""
+            {"data":[{"id":"historical-other-org","type":"issue"}],"links":{}}
+            """)));
+        var otherOrgTrigger = configuredTrigger(triggerId, "other-org", List.of());
+        var otherOrgRunContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, otherOrgTrigger), triggerContext, otherOrgTrigger
+        );
+        var otherOrgCondition = ConditionContext.builder().runContext(otherOrgRunContext).flow(flow).build();
+        assertTrue(otherOrgTrigger.evaluate(otherOrgCondition, triggerContext).isEmpty(),
+            "changing organization must establish a new baseline rather than emit historical issues");
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void pendingOverflowIsQueuedInBatchesAndPickedUpByLaterPolls() throws Exception {
+        var flowId = "snyk-backlog-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-backlog-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder()
+            .id(flowId)
+            .namespace("company.security")
+            .tenantId("test-tenant")
+            .build();
+        var triggerContext = TriggerContext.builder()
+            .tenantId("test-tenant")
+            .namespace(flow.getNamespace())
+            .flowId(flowId)
+            .triggerId(triggerId)
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        var issues = IntStream.range(0, 101)
+            .mapToObj(i -> "{\"id\":\"new-" + i + "\",\"type\":\"issue\"}")
+            .collect(Collectors.joining(","));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-large-backlog")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("large-backlog"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("snyk-large-backlog")
+            .whenScenarioStateIs("large-backlog")
+            .willReturn(okJson("{\"data\":[" + issues + "],\"links\":{}}")));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(), "initial poll establishes the baseline");
+
+        var first = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(first.isPresent());
+        assertEquals("new-0", ((Map<?, ?>) first.get().getTrigger().getVariables()).get("issueId"));
+
+        // Overflow IDs stay unknown until the pending queue drains, allowing later scans to rediscover them.
+        for (var expected = 1; expected < 100; expected++) {
+            var next = trigger.evaluate(conditionContext, triggerContext);
+            assertTrue(next.isPresent(), "queued issue new-" + expected + " should be emitted");
+            assertEquals("new-" + expected, ((Map<?, ?>) next.get().getTrigger().getVariables()).get("issueId"));
+        }
+        var overflow = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(overflow.isPresent(), "overflow issue should be picked up by a later scan rather than deadlocking polling");
+        assertEquals("new-100", ((Map<?, ?>) overflow.get().getTrigger().getVariables()).get("issueId"));
+        verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    void knownIssueIdsAreSplitIntoBoundedKvShards() throws Exception {
+        var ids = IntStream.range(0, IssueTrigger.MAX_IDS_PER_STATE_SHARD + 1)
+            .mapToObj(i -> "issue-" + i)
+            .toList();
+        var shards = IssueTrigger.chunkKnownIds(ids);
+        assertEquals(2, shards.size());
+        assertEquals(IssueTrigger.MAX_IDS_PER_STATE_SHARD, shards.getFirst().size());
+        assertEquals(1, shards.getLast().size());
+        assertEquals(ids, shards.stream().flatMap(List::stream).toList());
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void missingShardRecoversByEstablishingANewBaseline() throws Exception {
+        var flowId = "snyk-missing-shard-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-missing-shard-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("missing-shard-recovery")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("state-corrupted"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("missing-shard-recovery")
+            .whenScenarioStateIs("state-corrupted")
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-during-recovery","type":"issue"}],"links":{}}
+                """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler((DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger);
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        var kv = runContext.namespaceKv(flow.getNamespace());
+        var shard = kv.list().stream().filter(entry -> entry.key().startsWith(stateKey + "-g-"))
+            .findFirst().orElseThrow(() -> new AssertionError("baseline should have created an ID shard"));
+        assertTrue(kv.delete(shard.key()), "test setup should delete the selected shard");
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
+            "a missing shard should recover via a new baseline rather than fail every poll");
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty(),
+            "the recovered baseline should suppress historical duplicates");
+        verify(3, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void staleShardCleanupFailureDoesNotDropNewIssueExecution() throws Exception {
+        var flowId = "snyk-cleanup-failure-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-cleanup-failure-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("stale-shard-cleanup-failure")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("new-issue"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("stale-shard-cleanup-failure")
+            .whenScenarioStateIs("new-issue")
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-issue","type":"issue"}],"links":{}}
+                """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var initializedContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var kv = Mockito.spy(initializedContext.namespaceKv(flow.getNamespace()));
+        var runContext = Mockito.spy(initializedContext);
+        Mockito.doReturn(kv).when(runContext).namespaceKv(flow.getNamespace());
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        var staleShardKey = kv.list().stream()
+            .map(entry -> entry.key())
+            .filter(key -> key.startsWith(stateKey + "-g-"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("baseline should create a known-ID shard"));
+        Mockito.doThrow(new IOException("simulated stale shard cleanup failure")).when(kv).delete(staleShardKey);
+
+        var emitted = trigger.evaluate(conditionContext, triggerContext);
+
+        assertTrue(emitted.isPresent(), "a cleanup failure after the pointer commit must not drop the new issue execution");
+        assertEquals("new-issue", ((Map<?, ?>) emitted.get().getTrigger().getVariables()).get("issueId"));
+        assertTrue(kv.getValue(stateKey).isPresent(), "the state pointer must remain committed");
+        Mockito.verify(kv).delete(staleShardKey);
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void stagedShardWritesAreCleanedUpWhenAGenerationWriteFails() throws Exception {
+        var flowId = "snyk-partial-shard-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-partial-shard-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+        var issues = IntStream.range(0, IssueTrigger.MAX_IDS_PER_STATE_SHARD + 1)
+            .mapToObj(index -> "{\"id\":\"baseline-" + index + "\",\"type\":\"issue\"}")
+            .collect(Collectors.joining(","));
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("{\"data\":[" + issues + "],\"links\":{}}")));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var initializedContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var kv = Mockito.spy(initializedContext.namespaceKv(flow.getNamespace()));
+        var runContext = Mockito.spy(initializedContext);
+        Mockito.doReturn(kv).when(runContext).namespaceKv(flow.getNamespace());
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        Mockito.doAnswer(invocation -> {
+            var candidateKey = (String) invocation.getArgument(0);
+            if (candidateKey.startsWith(stateKey + "-g-") && candidateKey.endsWith("-ids-1")) {
+                throw new IOException("simulated second shard write failure");
+            }
+            return invocation.callRealMethod();
+        }).when(kv).put(Mockito.anyString(), Mockito.any(KVValueAndMetadata.class), Mockito.anyBoolean());
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+
+        assertTrue(error.getMessage().contains("simulated second shard write failure"));
+        assertTrue(kv.getValue(stateKey).isEmpty(), "a failed baseline write must not publish a pointer");
+        assertTrue(kv.list().stream().noneMatch(entry -> entry.key().startsWith(stateKey + "-g-")),
+            "all staged shards should be removed after a partial generation write");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void stagedShardsAreCleanedUpWhenStatePointerWriteFails() throws Exception {
+        var flowId = "snyk-pointer-write-failure-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-pointer-write-failure-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
+            {"data":[{"id":"baseline-issue","type":"issue"}],"links":{}}
+            """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var initializedContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var kv = Mockito.spy(initializedContext.namespaceKv(flow.getNamespace()));
+        var runContext = Mockito.spy(initializedContext);
+        Mockito.doReturn(kv).when(runContext).namespaceKv(flow.getNamespace());
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        Mockito.doAnswer(invocation -> {
+            var candidateKey = (String) invocation.getArgument(0);
+            if (candidateKey.equals(stateKey)) {
+                throw new IOException("simulated state pointer write failure");
+            }
+            return invocation.callRealMethod();
+        }).when(kv).put(Mockito.anyString(), Mockito.any(KVValueAndMetadata.class), Mockito.anyBoolean());
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+
+        var error = assertThrows(IllegalStateException.class, () -> trigger.evaluate(conditionContext, triggerContext));
+
+        assertTrue(error.getMessage().contains("simulated state pointer write failure"));
+        assertTrue(kv.getValue(stateKey).isEmpty(), "a failed pointer write must not publish trigger state");
+        assertTrue(kv.list().stream().noneMatch(entry -> entry.key().startsWith(stateKey + "-g-")),
+            "staged shards should be removed when the pointer write fails");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void reusedShardsRefreshTheirTtlAfterHalfTheStateLifetime() throws Exception {
+        var flowId = "snyk-shard-ttl-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-shard-ttl-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+        stubFor(get(urlPathEqualTo(PATH)).willReturn(okJson("""
+            {"data":[{"id":"existing","type":"issue"}],"links":{}}
+            """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler(
+            (DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger
+        );
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        var kv = runContext.namespaceKv(flow.getNamespace());
+        var shardKey = kv.list().stream()
+            .map(entry -> entry.key())
+            .filter(key -> key.startsWith(stateKey + "-g-"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("baseline should create a known-ID shard"));
+        var beforeExpiration = kv.get(shardKey).orElseThrow().expirationDate();
+        var rawPointer = kv.getValue(stateKey).orElseThrow().value();
+        assertTrue(rawPointer instanceof String, "pointer should be serialized JSON");
+        var stalePointer = ((String) rawPointer).replaceFirst(
+            "\"shardsWrittenAt\"\\s*:\\s*\\d+",
+            "\"shardsWrittenAt\":" + Instant.now().minus(IssueTrigger.STATE_TTL).toEpochMilli()
+        );
+        assertNotEquals(rawPointer, stalePointer, "test must backdate the shard refresh marker");
+        kv.put(stateKey,
+            new KVValueAndMetadata(new KVMetadata("Snyk issue trigger state", IssueTrigger.STATE_TTL), stalePointer), true);
+
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+        var afterExpiration = kv.get(shardKey).orElseThrow().expirationDate();
+
+        assertNotNull(beforeExpiration);
+        assertNotNull(afterExpiration);
+        assertTrue(afterExpiration.isAfter(beforeExpiration), "unchanged known-ID shards should receive a renewed TTL");
+        verify(2, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void drainPollDoesNotRewriteKnownIdShards() throws Exception {
+        var flowId = "snyk-drain-flow-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var triggerId = "snyk-drain-trigger-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        var flow = Flow.builder().id(flowId).namespace("company.security").tenantId("test-tenant").build();
+        var triggerContext = TriggerContext.builder().tenantId("test-tenant").namespace(flow.getNamespace())
+            .flowId(flowId).triggerId(triggerId).date(ZonedDateTime.now(ZoneOffset.UTC)).build();
+
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("drain-shard-reuse")
+            .whenScenarioStateIs(Scenario.STARTED)
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"}],"links":{}}
+                """))
+            .willSetStateTo("new-issues"));
+        stubFor(get(urlPathEqualTo(PATH))
+            .inScenario("drain-shard-reuse")
+            .whenScenarioStateIs("new-issues")
+            .willReturn(okJson("""
+                {"data":[{"id":"existing","type":"issue"},{"id":"new-1","type":"issue"},{"id":"new-2","type":"issue"}],"links":{}}
+                """)));
+
+        var trigger = configuredTrigger(triggerId, "org-id", List.of());
+        var runContext = runContextInitializer.forScheduler((DefaultRunContext) runContextFactory.of(flow, trigger), triggerContext, trigger);
+        var conditionContext = ConditionContext.builder().runContext(runContext).flow(flow).build();
+        assertTrue(trigger.evaluate(conditionContext, triggerContext).isEmpty());
+
+        var emitted = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(emitted.isPresent());
+        assertEquals("new-1", ((Map<?, ?>) emitted.get().getTrigger().getVariables()).get("issueId"));
+
+        var stateKey = IssueTrigger.stateKey(triggerContext);
+        var kv = runContext.namespaceKv(flow.getNamespace());
+        var before = kv.list().stream().filter(entry -> entry.key().startsWith(stateKey + "-g-"))
+            .map(entry -> entry.key() + "|" + entry.updateDate()).sorted().toList();
+        assertFalse(before.isEmpty(), "expected an ID shard after detecting new issues");
+
+        var queued = trigger.evaluate(conditionContext, triggerContext);
+        assertTrue(queued.isPresent());
+        assertEquals("new-2", ((Map<?, ?>) queued.get().getTrigger().getVariables()).get("issueId"));
+
+        var after = kv.list().stream().filter(entry -> entry.key().startsWith(stateKey + "-g-"))
+            .map(entry -> entry.key() + "|" + entry.updateDate()).sorted().toList();
+        assertEquals(before, after, "draining a pending issue should update only the state pointer, not the ID shards");
+        verify(2, getRequestedFor(urlPathEqualTo(PATH)));
+    }
+
+    private IssueTrigger configuredTrigger(String triggerId, String orgId, List<SnykConnection.Severity> severities) {
+        return IssueTrigger.builder()
+            .id(triggerId)
+            .type(IssueTrigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .baseUrl(Property.ofValue(BASE_URL))
+            .apiVersion(Property.ofValue("2024-10-15"))
+            .orgId(Property.ofValue(orgId))
+            .severities(Property.ofValue(severities))
+            .interval(Duration.ofMinutes(15))
+            .build();
+    }
+}
